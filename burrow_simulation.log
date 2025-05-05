@@ -1,0 +1,21 @@
+2025-04-30 07:21:36,523 - BurrowEnv - INFO - Initializing BurrowEnv in headless mode...
+2025-04-30 07:21:36,707 - BurrowEnv - INFO - Environment created successfully
+2025-04-30 07:21:36,715 - BurrowEnv - INFO - Starting headless simulation...
+2025-04-30 07:21:36,715 - BurrowEnv - INFO - Starting headless simulation with seed=None, episodes=3
+2025-04-30 07:21:36,716 - BurrowEnv - INFO - 
+=== Episode 1/3 ===
+2025-04-30 07:33:34,001 - BurrowEnv - INFO - Environment closed
+
+2025-05-01 22:40:00,091 - BurrowEnv - INFO - Initializing BurrowEnv in headless mode...
+2025-05-01 22:40:00,505 - BurrowEnv - INFO - Environment created successfully
+2025-05-01 22:40:00,506 - BurrowEnv - INFO - Starting headless simulation...
+2025-05-01 22:40:00,507 - BurrowEnv - INFO - Starting headless simulation with seed=None, episodes=3
+2025-05-01 22:40:00,507 - BurrowEnv - INFO - 
+=== Episode 1/3 ===
+2025-05-01 22:40:33,780 - BurrowEnv - INFO - Initializing BurrowEnv in headless mode...
+2025-05-01 22:40:33,983 - BurrowEnv - INFO - Environment created successfully
+2025-05-01 22:40:33,988 - BurrowEnv - INFO - Starting headless simulation...
+2025-05-01 22:40:33,988 - BurrowEnv - INFO - Starting headless simulation with seed=None, episodes=3
+2025-05-01 22:40:33,989 - BurrowEnv - INFO - 
+=== Episode 1/3 ===
+2025-05-01 22:47:17,513 - BurrowEnv - INFO - Environment closed
