@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import deque
 import random
+import os
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -65,7 +66,7 @@ class ConePenDQL:
         best_reward = -np.inf
 
         for ep in range(episodes):
-            obs, _ = env.reset()  # reset returns (observation, info)
+            obs, _ = env.reset()
             done = False
             total_reward = 0.0
 
@@ -122,14 +123,11 @@ class ConePenDQL:
                 target_val = torch.tensor([r])
             else:
                 with torch.no_grad():
-                    # Double DQN: select best action via online network
                     best_a = policy_dqn(self.state_to_dqn_input(s2)).argmax().item()
-                    # evaluate via target network
                     target_val = (r + self.discount_factor_g *
                                   target_dqn(self.state_to_dqn_input(s2))[best_a])
                     target_val = torch.tensor([target_val])
 
-            # build target Q vector
             target_q = target_dqn(s_t).clone()
             target_q[a] = target_val
             target_qs.append(target_q)
@@ -140,7 +138,6 @@ class ConePenDQL:
         self.optimizer.step()
 
     def state_to_dqn_input(self, state) -> torch.Tensor:
-        # state is already [d_ratio, v_norm, f_norm, time_frac]
         return torch.FloatTensor(state)
 
     def plot_progress(self, rewards, eps_hist):
@@ -169,42 +166,27 @@ class ConePenDQL:
 
         env.close()
 
-    # This line should be removed as the agent is created in the main block
-    # agent = ConePenDQL()
-    
-    # Change this to start in training mode instead of test mode
-   # agent.train(10000, render=True)  # Train for 10000 episodes with rendering
-    
-    # Comment out or remove the test line for now
-    # agent.test(5, "conepen_dql_best_ep9999.pt")  # This requires a trained model
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description='Train ConePen DQN agent')
-    parser.add_argument("--episodes", type=int, default=10000, help="Number of training episodes")
-    parser.add_argument("--render", action="store_true", help="Render the environment during training")
-    parser.add_argument("--test", action="store_true", help="Test mode instead of training")
-    parser.add_argument("--model", type=str, default="conepen_dql_best.pt", help="Model path for testing")
-    
+    parser = argparse.ArgumentParser(description='Train or test ConePen DQN agent')
+    parser.add_argument("--episodes", type=int, default=10000,
+                        help="number of training episodes")
+    parser.add_argument("--render", action="store_true",
+                        help="render environment during training")
+    parser.add_argument("--test", action="store_true",
+                        help="run in test mode instead of training")
+    parser.add_argument("--model", type=str, default="conepen_dql_best.pt",
+                        help="path to model file for testing")
     args = parser.parse_args()
-    
-    # Import here to avoid possible circular imports
-    import os
-    import torch
-    import envs
-    
-    # Create the agent
-    print("Creating ConePen DQN agent...")
+
     agent = ConePenDQL()
-    
-    # Decide whether to train or test
+
     if args.test:
-        # Test mode
-        if os.path.exists(args.model):
-            print(f"Testing model: {args.model}")
-            agent.test(5, args.model)
+        if not os.path.exists(args.model):
+            print(f"Model file {args.model} not found. Train first.")
         else:
-            print(f"Error: Model file {args.model} not found. Run training first.")
+            print(f"Testing with model {args.model}")
+            agent.test(5, args.model)
     else:
-        # Training mode
-        print(f"Training for {args.episodes} episodes, render={args.render}")
+        print(f"Training for {args.episodes} episodes (render={args.render})")
         agent.train(args.episodes, render=args.render)
