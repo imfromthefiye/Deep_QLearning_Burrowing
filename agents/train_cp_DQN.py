@@ -1,4 +1,4 @@
-import simulation.envs  # registers ConePenEnv
+import envs  # registers ConePenEnv
 import gymnasium as gym
 import numpy as np
 import matplotlib.pyplot as plt
@@ -169,10 +169,11 @@ class ConePenDQL:
 
         env.close()
 
-    agent = ConePenDQL()
+    # This line should be removed as the agent is created in the main block
+    # agent = ConePenDQL()
     
     # Change this to start in training mode instead of test mode
-    agent.train(10000, render=True)  # Train for 10000 episodes with rendering
+   # agent.train(10000, render=True)  # Train for 10000 episodes with rendering
     
     # Comment out or remove the test line for now
     # agent.test(5, "conepen_dql_best_ep9999.pt")  # This requires a trained model
