@@ -1,7 +1,9 @@
+import gymnasium as gym
+from gymnasium import spaces
 import pygame
 from Box2D import (
     b2World, b2PolygonShape, b2FixtureDef, b2CircleShape,
-    b2PrismaticJointDef, b2ContactListener, b2ContactImpulse, b2MouseJointDef
+    b2PrismaticJointDef, b2ContactListener, b2ContactImpulse
 )
 import time
 import cv2  # Add OpenCV for video recording
@@ -9,7 +11,7 @@ import os
 import numpy as np
 
 # ================== Environment Constants ==================
-CHAMBER_WIDTH = 0.8   # meters
+CHAMBER_WIDTH = 1  # meters
 CHAMBER_HEIGHT = 1.0  # meters
 MARGIN = 0.1          # meters border
 SCALE = 400.0         # px per meter
@@ -101,6 +103,7 @@ def create_chamber(world):
     ))
     
     return walls
+
 # ================== Probe Parameters ==================
 # Probe parameters
 SHAFT_W, SHAFT_H = 0.05, 0.5
@@ -109,52 +112,15 @@ TIP_HEIGHT = SHAFT_W * 0.6
 
 # Position the probe closer to the soil bed
 soil_height = CHAMBER_HEIGHT / 3
-PROBE_POS_Y = soil_height   # Only small clearance above soil
+PROBE_POS_Y = soil_height + 0.05  # Small clearance above soil
 EXPANSION_RATIO = 1.2
-TIP_EXTENSION_SPEED = 0.03
+EXPANSION_DISTANCE = 0.05  # Target expansion distance (meters)
 
-# Autonomous motion parameters
-PENETRATION_SPEED = 0.05      # m/s (slower for better physics)
-EXPANSION_SPEED = 0.05        # m/s (horizontal expansion speed)
-RETRACTION_SPEED = 0.05       # m/s (tip retraction speed)
-BODY_FOLLOW_SPEED = 0.08      # m/s (body follows tip speed)
-
-# Target depths and distances
-PENETRATION_TARGET = -0.24    # m (target penetration depth for tip)
-EXPANSION_DISTANCE = 0.1      # m (how far to expand each shaft)
-TIP_EXTENSION_DISTANCE = 0.05 # m (how far to extend the tip)
-
-# Phase duration limits
-SETTLING_TIME = 2.0           # seconds for initial settling
-EXPANSION_TIME = 2.0          # seconds for expansion phase
-EXTENSION_TIME = 1.0          # seconds for tip extension
-MAX_PHASE_TIME = 10.0         # maximum time per phase as safety
-
-# ================== Phases ==================
-PHASES = [
-    'settling',          # Let the soil settle
-    'cone_penetration',  # Move probe down to target depth
-    'anchor_expansion',  # Expand anchor horizontally
-    'tip_extension',     # Extend the tip downward
-    'body_follows',      # Move body down to follow tip
-    'complete'           # Test complete
-]
-# ================== Helper: world->screen ==================
-def world_to_screen(x, y):
-    # Move the origin to bottom-left corner of the chamber
-    # This positions the chamber floor at the bottom of the viewport with a small margin
-    sx = int((x + CHAMBER_WIDTH/2 + MARGIN) * SCALE)
-    
-    # Flip Y-axis and position the origin at the bottom with a small margin
-    # This ensures the floor appears at the bottom of the screen
-    bottom_margin = MARGIN * 2  # Extra margin at the bottom
-    sy = int(VIEWPORT_H - ((y + bottom_margin) * SCALE))
-    
-    return sx, sy
-
-def world_to_screen_pts(pt):
-    x, y = pt
-    return world_to_screen(x, y)
+# Speed parameters
+NORMAL_SPEED = 0.05   # m/s for expansion
+MAX_SAFE_SPEED = 0.1  # m/s maximum safe speed
+MAX_FORCE = 50.0      # N maximum expected force
+MAX_STEPS = 500       # Maximum episode length
 
 # ================== Contact Listener ==================
 class ContactDetector(b2ContactListener):
@@ -169,322 +135,553 @@ class ContactDetector(b2ContactListener):
         if any(part in bodies for part in self.probe_parts):
             self.probe_impulse += total
 
-# ================== World Setup ==================
-def create_split_probe(world):
-    # Create left shaft
-    left_shaft = world.CreateDynamicBody(
-        position=(-SHAFT_W/4, PROBE_POS_Y),
-        fixedRotation=True,
-        fixtures=b2FixtureDef(
-            shape=b2PolygonShape(box=(SHAFT_W/4, SHAFT_H/2)),
-            density=1.0, friction=0.2
-        )
-    )
+# ================== Helper Functions ==================
+def world_to_screen(x, y):
+    # Move the origin to bottom-left corner of the chamber
+    sx = int((x + CHAMBER_WIDTH/2 + MARGIN) * SCALE)
     
-    # Create right shaft
-    right_shaft = world.CreateDynamicBody(
-        position=(SHAFT_W/4, PROBE_POS_Y),
-        fixedRotation=True,
-        fixtures=b2FixtureDef(
-            shape=b2PolygonShape(box=(SHAFT_W/4, SHAFT_H/2)),
-            density=1.0, friction=0.2
-        )
-    )
+    # Flip Y-axis and position the origin at the bottom with a small margin
+    bottom_margin = MARGIN * 2  # Extra margin at the bottom
+    sy = int(VIEWPORT_H - ((y + bottom_margin) * SCALE))
     
-    # Create tip - position it exactly at the bottom of shafts
-    tip_y_pos = PROBE_POS_Y - SHAFT_H/2 - TIP_HEIGHT/2
-    tip = world.CreateDynamicBody(
-        position=(0.0, tip_y_pos),
-        fixedRotation=True,
-        fixtures=b2FixtureDef(
-            shape=b2PolygonShape(vertices=[
-                (-TIP_BASE/2, TIP_HEIGHT/2),
-                (TIP_BASE/2, TIP_HEIGHT/2),
-                (0.0, -TIP_HEIGHT/2)
-            ]),
-            density=1.0, friction=0.2
-        )
-    )
-    
-    # Disable gravity for all probe parts
-    left_shaft.gravityScale = 0.0
-    right_shaft.gravityScale = 0.0
-    tip.gravityScale = 0.0
-    
-    # Create weld joints to connect tip to both shaft halves
-    world.CreateWeldJoint(
-        bodyA=left_shaft,
-        bodyB=tip,
-        anchor=(left_shaft.position.x, tip_y_pos + TIP_HEIGHT/2),
-        referenceAngle=0.0
-    )
-    
-    world.CreateWeldJoint(
-        bodyA=right_shaft,
-        bodyB=tip,
-        anchor=(right_shaft.position.x, tip_y_pos + TIP_HEIGHT/2),
-        referenceAngle=0.0
-    )
-    
-    return left_shaft, right_shaft, tip
+    return sx, sy
 
-def create_anchor_joint(world, left, right):
-    # Create a prismatic joint between left and right shafts
-    # This allows them to move horizontally relative to each other
-    pj = b2PrismaticJointDef()
-    pj.Initialize(left, right, anchor=(0, left.position.y), axis=(1, 0))
+# ================== AnchorExp Environment ==================
+class AnchorExpEnv(gym.Env):
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": FPS}
     
-    pj.enableLimit = True
-    pj.lowerTranslation = 0.0  # Cannot get closer
-    pj.upperTranslation = SHAFT_W * EXPANSION_RATIO  # Max expansion distance
-    
-    pj.enableMotor = True
-    pj.motorSpeed = 0.0  # Start with no movement
-    pj.maxMotorForce = 500.0
-    
-    return world.CreateJoint(pj)
-
-# ================== Anchor Expansion Logic ==================
-def update_anchor_expansion(anchor_joint, left, right, speed=0.02, max_dx=0.2):
-    anchor_joint.motorSpeed = speed
-    dx = abs(right.position.x - left.position.x)
-    if dx >= max_dx:
-        anchor_joint.motorSpeed = 0.0
-        return True
-    return False
-
-# ================ Rendering =================
-def draw_probe_parts(screen, left, right, tip):
-    # Draw left shaft
-    for fixture in left.fixtures:
-        shape = fixture.shape
-        if isinstance(shape, b2PolygonShape):
-            vertices = [left.transform * v for v in shape.vertices]
-            pts = [world_to_screen_pts(v) for v in vertices]
-            pygame.draw.polygon(screen, (100, 100, 255), pts)
-    
-    # Draw right shaft
-    for fixture in right.fixtures:
-        shape = fixture.shape
-        if isinstance(shape, b2PolygonShape):
-            vertices = [right.transform * v for v in shape.vertices]
-            pts = [world_to_screen_pts(v) for v in vertices]
-            pygame.draw.polygon(screen, (100, 100, 255), pts)
-    
-    # Draw tip
-    for fixture in tip.fixtures:
-        shape = fixture.shape
-        if isinstance(shape, b2PolygonShape):
-            vertices = [tip.transform * v for v in shape.vertices]
-            pts = [world_to_screen_pts(v) for v in vertices]
-            pygame.draw.polygon(screen, (255, 100, 100), pts)
-
-def draw_grains(screen, grains):
-    for grain in grains:
-        x, y = world_to_screen(grain.position.x, grain.position.y)
-        pygame.draw.circle(screen, (150, 150, 150), (x, y), int(GRAIN_RADIUS * SCALE))
-
-def fix_probe_position(world, ground, left, right, tip):
-    """Create temporary mouse joints to fix probe position"""
-    # Create mouse joints to temporarily fix each part in place
-    mj_left = world.CreateJoint(b2MouseJointDef(
-        bodyA=ground,
-        bodyB=left,
-        target=left.position,
-        maxForce=1000.0 * left.mass,
-        frequencyHz=100.0,
-        dampingRatio=1.0
-    ))
-    
-    mj_right = world.CreateJoint(b2MouseJointDef(
-        bodyA=ground,
-        bodyB=right,
-        target=right.position,
-        maxForce=1000.0 * right.mass,
-        frequencyHz=100.0,
-        dampingRatio=1.0
-    ))
-    
-    mj_tip = world.CreateJoint(b2MouseJointDef(
-        bodyA=ground,
-        bodyB=tip,
-        target=tip.position,
-        maxForce=1000.0 * tip.mass,
-        frequencyHz=100.0,
-        dampingRatio=1.0
-    ))
-    
-    return [mj_left, mj_right, mj_tip]
-
-def main():
-    # Initialize pygame
-    pygame.init()
-    screen = pygame.display.set_mode((VIEWPORT_W, VIEWPORT_H))
-    pygame.display.set_caption("Anchore Expansion Simulation")
-    clock = pygame.time.Clock()
-    font = pygame.font.SysFont('Arial', 16)
-    
-    # Create world with gravity
-    world = b2World(gravity=(0, -9.81))
-    
-    # Create explicit ground body
-    ground = world.CreateStaticBody(position=(0, 0))
-    
-    # Create chamber walls
-    walls = create_chamber(world)
-    
-    # Create probe parts using the create_split_probe function
-    left_shaft, right_shaft, tip = create_split_probe(world)
-    
-    # Get probe positions and dimensions for collision avoidance
-    probe_x_min = min(left_shaft.position.x - SHAFT_W/4, tip.position.x - TIP_BASE/2)
-    probe_x_max = max(right_shaft.position.x + SHAFT_W/4, tip.position.x + TIP_BASE/2)
-    probe_y_min = tip.position.y - TIP_HEIGHT/2
-    probe_y_max = max(left_shaft.position.y + SHAFT_H/2, right_shaft.position.y + SHAFT_H/2)
-    
-    # Create grains avoiding the probe area
-    grains = []
-    grain_diameter = GRAIN_RADIUS * 2
-    COLS = int(CHAMBER_WIDTH / grain_diameter) + 2
-    soil_height = CHAMBER_HEIGHT / 3
-    ROWS = int(soil_height / (grain_diameter * 0.84))
-    x0 = -(COLS-1) * grain_diameter / 2
-    y0 = GRAIN_RADIUS
-    
-    for i in range(ROWS):
-        for j in range(COLS):
-            x = x0 + j * grain_diameter + (0.5 * grain_diameter if i % 2 else 0)
-            y = y0 + i * (grain_diameter * 0.84)
-            
-            # Add random jitter
-            x += np.random.uniform(-0.002, 0.002)
-            y += np.random.uniform(-0.002, 0.002)
-            
-            # Skip if grain would be outside chamber
-            if abs(x) > (CHAMBER_WIDTH/2 + GRAIN_RADIUS/2):
-                continue
-                
-            # Skip if grain would overlap with probe (add small buffer)
-            buffer = GRAIN_RADIUS * 1.1
-            if (x + buffer > probe_x_min and x - buffer < probe_x_max and 
-                y + buffer > probe_y_min and y - buffer < probe_y_max):
-                continue
-                
-            body = world.CreateDynamicBody(
-                position=(x, y),
-                fixtures=b2FixtureDef(
-                    shape=b2CircleShape(radius=GRAIN_RADIUS),
-                    density=2.5,
-                    friction=0.6,
-                    restitution=0.0
-                ),
-                linearDamping=0.5,
-                angularDamping=0.6
-            )
-            body.bullet = True
-            grains.append(body)
-    
-    # Create the anchor joint between shafts
-    anchor_joint = create_anchor_joint(world, left_shaft, right_shaft)
-    
-    # Fix probe in place
-    mouse_joints = fix_probe_position(world, ground, left_shaft, right_shaft, tip)
-    
-    # Expansion parameters
-    EXPANSION_DISTANCE = 0.2  # Maximum expansion distance for each half (D)
-    EXPANSION_SPEED = 0.05    # Speed of expansion (m/s)
-    expansion_started = False
-    expansion_complete = False
-    
-    # Start simulation loop with settling time
-    running = True
-    settling_time = 2.0  # seconds
-    start_time = time.time()
-    settling_end_time = start_time + settling_time
-    
-    while running:
-        current_time = time.time()
-        elapsed_time = current_time - start_time
+    def __init__(self, render_mode=None):
+        # Initialize rendering components
+        self.screen = None
+        self.clock = None
+        self.isopen = True
+        self.render_mode = render_mode
         
-        # Handle events
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    running = False
-                elif event.key == pygame.K_SPACE and current_time >= settling_end_time and not expansion_started:
-                    # Start expansion on SPACE key after settling
-                    for joint in mouse_joints:
-                        world.DestroyJoint(joint)
-                    mouse_joints = []
-                    expansion_started = True
-                    # Set motor speed to start expansion
-                    anchor_joint.motorSpeed = EXPANSION_SPEED
+        # Initialize physics world
+        self.world = None
+        self.chamber = None
+        self.grains = []
+        self.left_shaft = None
+        self.right_shaft = None
+        self.tip = None
+        self.anchor_joint = None
         
-        # Auto-start expansion after settling
-        if not expansion_started and current_time >= settling_end_time + 1.0:
-            for joint in mouse_joints:
-                world.DestroyJoint(joint)
-            mouse_joints = []
-            expansion_started = True
-            # Set motor speed to start expansion
-            anchor_joint.motorSpeed = EXPANSION_SPEED
+        # State tracking
+        self.current_expansion = 0.0
+        self.current_velocity = 0.0
+        self.current_force = 0.0
+        self.initial_distance = 0.0
+        self.step_count = 0
+        self.contact_detector = None
         
-        # Check for expansion completion
-        if expansion_started and not expansion_complete:
-            # Get current translation - use the correct attribute
-            translation = anchor_joint.translation
+        # Define observation space (normalized values)
+        # [expansion_ratio, velocity, force, time_step_ratio]
+        self.observation_space = spaces.Box(
+            low=np.array([0.0, -1.0, 0.0, 0.0], dtype=np.float32),
+            high=np.array([2.0, 1.0, 1.0, 1.0], dtype=np.float32),
+            dtype=np.float32
+        )
+        
+        # Define action space
+        # 0: Expand, 1: Contract, 2: Stop
+        self.action_space = spaces.Discrete(3)
+    
+    def _destroy(self):
+        """Clean up Box2D objects"""
+        if self.world is None:
+            return
             
-            # Check if we've reached the expansion limit
-            if translation >= EXPANSION_DISTANCE:
-                anchor_joint.motorSpeed = 0.0  # Stop the motor
-                expansion_complete = True
+        # Destroy grains
+        for grain in self.grains:
+            self.world.DestroyBody(grain)
+        self.grains = []
+        
+        # Destroy probe parts
+        if self.left_shaft is not None:
+            self.world.DestroyBody(self.left_shaft)
+            self.left_shaft = None
+        if self.right_shaft is not None:
+            self.world.DestroyBody(self.right_shaft)
+            self.right_shaft = None
+        if self.tip is not None:
+            self.world.DestroyBody(self.tip)
+            self.tip = None
+        
+        # Destroy chamber
+        if self.chamber is not None:
+            for wall in self.chamber:
+                self.world.DestroyBody(wall)
+            self.chamber = None
+    
+    def reset(self, seed=None, options=None):
+        """Reset the environment to initial state"""
+        super().reset(seed=seed)
+        
+        # Clean up previous episode
+        self._destroy()
+        
+        # Create new world with downward gravity
+        self.world = b2World(gravity=(0.0, -5.0))
+        
+        # Create chamber
+        self.chamber = self._create_chamber()
+        
+        # Create the split probe (left shaft, right shaft, and tip)
+        self.left_shaft, self.right_shaft, self.tip = self._create_probe()
+        
+        # Get probe positions and dimensions for collision avoidance
+        probe_x_min = min(self.left_shaft.position.x - SHAFT_W/4, self.tip.position.x - TIP_BASE/2)
+        probe_x_max = max(self.right_shaft.position.x + SHAFT_W/4, self.tip.position.x + TIP_BASE/2)
+        probe_y_min = self.tip.position.y - TIP_HEIGHT/2
+        probe_y_max = max(self.left_shaft.position.y + SHAFT_H/2, self.right_shaft.position.y + SHAFT_H/2)
+        
+        # Create grains avoiding the probe area
+        self.grains = self._create_grains(probe_x_min, probe_x_max, probe_y_min, probe_y_max)
+        
+        # Create anchor joint between shafts
+        self.anchor_joint = self._create_anchor_joint(self.left_shaft, self.right_shaft)
+        
+        # Create contact detector
+        self.contact_detector = ContactDetector([self.left_shaft, self.right_shaft, self.tip])
+        self.world.contactListener = self.contact_detector
+        
+        # Reset state variables
+        self.step_count = 0
+        self.initial_distance = abs(self.right_shaft.position.x - self.left_shaft.position.x)
+        self.current_expansion = 0.0
+        self.current_velocity = 0.0
+        self.current_force = 0.0
+        
+        # Let the world settle briefly
+        for _ in range(10):
+            self.world.Step(TIME_STEP, VEL_ITERS, POS_ITERS)
+        
+        # Update observation
+        self._update_state()
+        
+        # Render if needed
+        if self.render_mode == "human":
+            self.render()
+        
+        return self._get_observation(), {}
+    
+    def step(self, action):
+        """Take a step in the environment"""
+        assert self.action_space.contains(action), f"Invalid action: {action}"
+        
+        self.step_count += 1
+        
+        # Reset force measurement before physics step
+        self.contact_detector.probe_impulse = 0.0
+        
+        # Apply action
+        if action == 0:  # Expand
+            self.anchor_joint.motorSpeed = NORMAL_SPEED
+        elif action == 1:  # Contract
+            self.anchor_joint.motorSpeed = -NORMAL_SPEED
+        elif action == 2:  # Stop
+            self.anchor_joint.motorSpeed = 0.0
         
         # Step physics
-        world.Step(TIME_STEP, VEL_ITERS, POS_ITERS)
+        self.world.Step(TIME_STEP, VEL_ITERS, POS_ITERS)
         
-        # Render everything
-        screen.fill((255, 255, 255))
+        # Update state variables
+        self._update_state()
+        
+        # Calculate reward
+        reward = self._calculate_reward()
+        
+        # Check termination conditions
+        terminated = False
+        truncated = False
+        
+        # Success: reached target expansion (95-105% of target)
+        if 0.95 <= self.current_expansion <= 1.05:
+            terminated = True
+            reward += 10.0  # Completion bonus
+        
+        # Failure: overexpanded
+        elif self.current_expansion > 1.1:
+            terminated = True
+            reward -= 10.0  # Over-expansion penalty
+        
+        # Truncation: exceeded maximum steps
+        if self.step_count >= MAX_STEPS:
+            truncated = True
+            reward -= 5.0  # Timeout penalty
+        
+        if self.render_mode == "human":
+            self.render()
+        
+        return self._get_observation(), reward, terminated, truncated, {}
+    
+    def _update_state(self):
+        """Update the state variables based on current simulation state"""
+        # Calculate the current expansion as a ratio of the target expansion
+        distance = abs(self.right_shaft.position.x - self.left_shaft.position.x)
+        target_distance = self.initial_distance + EXPANSION_DISTANCE
+        self.current_expansion = (distance - self.initial_distance) / EXPANSION_DISTANCE
+        
+        # Get current velocity (normalized)
+        self.current_velocity = self.anchor_joint.speed / MAX_SAFE_SPEED
+        
+        # Get current force (normalized)
+        self.current_force = min(self.contact_detector.probe_impulse / MAX_FORCE, 1.0)
+    
+    def _calculate_reward(self):
+        """Calculate the reward for the current state"""
+        reward = 0.0
+        
+        # 1. Progress reward: reward for progress toward target expansion
+        prev_expansion = self.current_expansion - self.anchor_joint.speed * TIME_STEP / EXPANSION_DISTANCE
+        expansion_progress = self.current_expansion - prev_expansion
+        reward += expansion_progress * 5.0  # Scale up the progress reward
+        
+        # 2. Efficiency penalty: small penalty for each step to encourage efficiency
+        reward -= 0.01
+        
+        # 3. Force penalty: penalty proportional to the force on the anchor
+        force_penalty = 0.1 * self.current_force
+        reward -= force_penalty
+        
+        # 4 & 5. Completion bonus and over-expansion penalty are handled in the step function
+        # where we can terminate the episode
+        
+        return reward
+    
+    def _get_observation(self):
+        """Get the current observation vector"""
+        return np.array([
+            self.current_expansion,
+            self.current_velocity,
+            self.current_force,
+            self.step_count / MAX_STEPS
+        ], dtype=np.float32)
+    
+    def _create_chamber(self):
+        """Create the chamber walls"""
+        # Wall thickness
+        t = 0.01
+        
+        # Calculate half width
+        half_w = CHAMBER_WIDTH / 2
+        
+        walls = []
+        
+        # Left wall - place it just outside the leftmost grains
+        walls.append(self.world.CreateStaticBody(
+            position=(-half_w - t/2, CHAMBER_HEIGHT/2),
+            fixtures=b2FixtureDef(shape=b2PolygonShape(box=(t/2, CHAMBER_HEIGHT/2)), friction=0.6)
+        ))
+        
+        # Right wall - place it just outside the rightmost grains
+        walls.append(self.world.CreateStaticBody(
+            position=(half_w + t/2, CHAMBER_HEIGHT/2),
+            fixtures=b2FixtureDef(shape=b2PolygonShape(box=(t/2, CHAMBER_HEIGHT/2)), friction=0.6)
+        ))
+        
+        # Floor - place it directly beneath the grains at y=0
+        walls.append(self.world.CreateStaticBody(
+            position=(0.0, -t/2),
+            fixtures=b2FixtureDef(shape=b2PolygonShape(box=(half_w + t, t/2)), friction=0.6)
+        ))
+        
+        return walls
+    
+    def _create_grains(self, probe_x_min, probe_x_max, probe_y_min, probe_y_max):
+        """Create soil grains while avoiding the probe area"""
+        grains = []
+        
+        # Define the grain arrangement first
+        grain_diameter = GRAIN_RADIUS * 2
+        
+        # Calculate rows and columns based on chamber width
+        COLS = int(CHAMBER_WIDTH / grain_diameter) + 2  # Add extra columns
+        
+        # Fill 1/3 of chamber height with grains
+        soil_height = CHAMBER_HEIGHT / 3
+        ROWS = int(soil_height / (grain_diameter * 0.84))  # Reduced from 0.866 for tighter packing
+        
+        # Center the array horizontally
+        x0 = -(COLS-1) * grain_diameter / 2
+        
+        # Position grains starting at y=0 (we'll adjust the chamber floor later)
+        y0 = GRAIN_RADIUS  # Bottom of first grain at y=0
+        
+        # Calculate tip width at different heights for more precise collision detection
+        # The tip is triangular, so its width varies with height
+        def get_tip_width_at_height(height_from_tip_bottom):
+            # At tip_bottom (height=0), width is 0
+            # At tip_top (height=TIP_HEIGHT), width is TIP_BASE
+            if height_from_tip_bottom <= 0:
+                return 0
+            elif height_from_tip_bottom >= TIP_HEIGHT:
+                return TIP_BASE
+            else:
+                return (height_from_tip_bottom / TIP_HEIGHT) * TIP_BASE
+        
+        for i in range(ROWS):
+            for j in range(COLS):
+                # Offset alternate rows for hexagonal packing
+                x = x0 + j * grain_diameter + (0.5 * grain_diameter if i % 2 else 0)
+                y = y0 + i * (grain_diameter * 0.84)  # Reduced from 0.866 for tighter packing
+                
+                # Add random jitter to avoid perfect lattice arrangement
+                x += np.random.uniform(-0.002, 0.002)
+                y += np.random.uniform(-0.002, 0.002)
+                
+                # Skip if grain would be outside chamber
+                if abs(x) > (CHAMBER_WIDTH/2 + GRAIN_RADIUS/2):
+                    continue
+                
+                # Probe collision check with special handling for the tip area
+                buffer = GRAIN_RADIUS * 1.1
+                
+                # Check if we're in the tip area
+                if y < probe_y_min + TIP_HEIGHT and y >= probe_y_min - buffer:
+                    # Calculate how far we are from the tip bottom
+                    height_from_tip_bottom = y - (probe_y_min - TIP_HEIGHT/2) + buffer
+                    # Get width of tip at this height
+                    tip_width = get_tip_width_at_height(height_from_tip_bottom)
+                    # Only skip if we're within the actual triangular shape + buffer
+                    tip_x_min = -tip_width/2
+                    tip_x_max = tip_width/2
+                    if abs(x) < tip_width/2 + buffer:
+                        continue
+                # For non-tip areas, use standard bounding box check
+                elif (x + buffer > probe_x_min and x - buffer < probe_x_max and 
+                      y + buffer > probe_y_min and y - buffer < probe_y_max):
+                    continue
+                    
+                body = self.world.CreateDynamicBody(
+                    position=(x, y),
+                    fixtures=b2FixtureDef(
+                        shape=b2CircleShape(radius=GRAIN_RADIUS),
+                        density=2.5,       # Increased mass to resist movement
+                        friction=0.6,      # friction for resistance
+                        restitution=0.0    # no bounce
+                    ),
+                    linearDamping=0.5,   # Reduced from 0.8 to allow more flow
+                    angularDamping=0.6    # Reduced from 0.9 to allow more rotation
+                )
+                # Enable continuous collision detection to prevent tunneling
+                body.bullet = True
+                grains.append(body)
+        
+        return grains
+    
+    def _create_probe(self):
+        """Create split probe (left shaft, right shaft, and tip)"""
+        # Create left shaft
+        left_shaft = self.world.CreateDynamicBody(
+            position=(-SHAFT_W/4, PROBE_POS_Y),
+            fixedRotation=True,
+            fixtures=b2FixtureDef(
+                shape=b2PolygonShape(box=(SHAFT_W/4, SHAFT_H/2)),
+                density=1.0, friction=0.2
+            )
+        )
+        
+        # Create right shaft
+        right_shaft = self.world.CreateDynamicBody(
+            position=(SHAFT_W/4, PROBE_POS_Y),
+            fixedRotation=True,
+            fixtures=b2FixtureDef(
+                shape=b2PolygonShape(box=(SHAFT_W/4, SHAFT_H/2)),
+                density=1.0, friction=0.2
+            )
+        )
+        
+        # Create tip - position it at the bottom of shafts
+        tip = self.world.CreateDynamicBody(
+            position=(0.0, PROBE_POS_Y - SHAFT_H/2 - TIP_HEIGHT/2),
+            fixedRotation=True,
+            fixtures=b2FixtureDef(
+                shape=b2PolygonShape(vertices=[
+                    (-TIP_BASE/2, TIP_HEIGHT/2),
+                    (TIP_BASE/2, TIP_HEIGHT/2),
+                    (0.0, -TIP_HEIGHT/2)
+                ]),
+                density=1.0, friction=0.2
+            )
+        )
+        
+        # Disable gravity for all probe parts
+        left_shaft.gravityScale = 0.0
+        right_shaft.gravityScale = 0.0
+        tip.gravityScale = 0.0
+        
+        # Create weld joints to connect tip to both shaft halves
+        self.world.CreateWeldJoint(
+            bodyA=left_shaft,
+            bodyB=tip,
+            anchor=(left_shaft.position.x, tip.position.y + TIP_HEIGHT/2),
+            referenceAngle=0.0
+        )
+        
+        self.world.CreateWeldJoint(
+            bodyA=right_shaft,
+            bodyB=tip,
+            anchor=(right_shaft.position.x, tip.position.y + TIP_HEIGHT/2),
+            referenceAngle=0.0
+        )
+        
+        return left_shaft, right_shaft, tip
+    
+    def _create_anchor_joint(self, left, right):
+        """Create a prismatic joint between left and right shafts"""
+        pj = b2PrismaticJointDef()
+        pj.Initialize(left, right, anchor=(0, left.position.y), axis=(1, 0))
+        
+        pj.enableLimit = True
+        pj.lowerTranslation = 0.0  # Cannot get closer
+        pj.upperTranslation = SHAFT_W * EXPANSION_RATIO  # Max expansion distance
+        
+        pj.enableMotor = True
+        pj.motorSpeed = 0.0  # Start with no movement
+        pj.maxMotorForce = 500.0
+        
+        return self.world.CreateJoint(pj)
+    
+    def render(self):
+        """Render the environment"""
+        if self.render_mode is None:
+            return
+            
+        # Initialize pygame if needed
+        if self.screen is None:
+            pygame.init()
+            pygame.display.init()
+            self.screen = pygame.display.set_mode((VIEWPORT_W, VIEWPORT_H))
+            pygame.display.set_caption("Anchor Expansion")
+            self.clock = pygame.time.Clock()
+            self.font = pygame.font.Font(None, 24)
+        
+        self.screen.fill((255,255,255))  # White background
         
         # Draw chamber walls
-        for wall in walls:
-            for fixture in wall.fixtures:
+        for body in self.chamber:
+            for fixture in body.fixtures:
                 shape = fixture.shape
-                vertices = [(wall.transform * v) for v in shape.vertices]
-                screen_vertices = [world_to_screen(v.x, v.y) for v in vertices]
-                pygame.draw.polygon(screen, (50, 50, 50), screen_vertices)
+                if isinstance(shape, b2PolygonShape):
+                    vertices = [body.transform * v for v in shape.vertices]
+                    points = [world_to_screen(v[0], v[1]) for v in vertices]
+                    pygame.draw.polygon(self.screen, (50, 50, 50), points)
         
         # Draw grains
-        draw_grains(screen, grains)
+        for grain in self.grains:
+            x, y = world_to_screen(grain.position.x, grain.position.y)
+            pygame.draw.circle(self.screen, (150, 150, 150), (x, y), int(GRAIN_RADIUS * SCALE))
         
-        # Draw probe parts
-        draw_probe_parts(screen, left_shaft, right_shaft, tip)
+        # Draw left shaft
+        for fixture in self.left_shaft.fixtures:
+            shape = fixture.shape
+            if isinstance(shape, b2PolygonShape):
+                vertices = [self.left_shaft.transform * v for v in shape.vertices]
+                points = [world_to_screen(v[0], v[1]) for v in vertices]
+                pygame.draw.polygon(self.screen, (100, 100, 255), points)
         
-        # Get current translation for display
-        translation = anchor_joint.translation
+        # Draw right shaft
+        for fixture in self.right_shaft.fixtures:
+            shape = fixture.shape
+            if isinstance(shape, b2PolygonShape):
+                vertices = [self.right_shaft.transform * v for v in shape.vertices]
+                points = [world_to_screen(v[0], v[1]) for v in vertices]
+                pygame.draw.polygon(self.screen, (100, 100, 255), points)
         
-        # Display status text
-        if current_time < settling_end_time:
-            status = f"SETTLING: {settling_time - (current_time - start_time):.1f}s left"
-        elif not expansion_started:
-            status = f"READY: Press SPACE to start expansion"
-        elif not expansion_complete:
-            status = f"EXPANDING: {translation:.3f}m / {EXPANSION_DISTANCE:.3f}m"
-        else:
-            status = f"COMPLETE: {translation:.3f}m expansion reached"
+        # Draw tip
+        for fixture in self.tip.fixtures:
+            shape = fixture.shape
+            if isinstance(shape, b2PolygonShape):
+                vertices = [self.tip.transform * v for v in shape.vertices]
+                points = [world_to_screen(v[0], v[1]) for v in vertices]
+                pygame.draw.polygon(self.screen, (255, 100, 100), points)
         
-        info_text = f"Time: {elapsed_time:.2f}s    Status: {status}"
-        text_surface = font.render(info_text, True, (0, 0, 0))
-        screen.blit(text_surface, (10, 10))
+        # Display information
+        text = self.font.render(f"Expansion: {self.current_expansion:.3f}", True, (0, 0, 0))
+        self.screen.blit(text, (10, 10))
         
-        # Update display
-        pygame.display.flip()
+        velocity_text = self.font.render(f"Speed: {self.current_velocity:.3f}", True, (0, 0, 0))
+        self.screen.blit(velocity_text, (10, 40))
         
-        # Cap framerate
-        clock.tick(FPS)
+        force_text = self.font.render(f"Force: {self.current_force:.3f}", True, (0, 0, 0))
+        self.screen.blit(force_text, (10, 70))
+        
+        step_text = self.font.render(f"Step: {self.step_count}", True, (0, 0, 0))
+        self.screen.blit(step_text, (10, 100))
+        
+        if self.render_mode == "human":
+            pygame.event.pump()
+            pygame.display.flip()
+            self.clock.tick(self.metadata["render_fps"])
+            
+        elif self.render_mode == "rgb_array":
+            return np.transpose(
+                np.array(pygame.surfarray.pixels3d(self.screen)), axes=(1, 0, 2)
+            )
     
-    pygame.quit()
+    def close(self):
+        """Close the environment"""
+        if self.screen is not None:
+            pygame.display.quit()
+            pygame.quit()
+            self.screen = None
+
+def main():
+    """Run the environment for debugging purposes"""
+    env = AnchorExpEnv(render_mode="human")
+    observation, info = env.reset()
+    
+    print("AnchorExp Environment Initialized")
+    print(f"Observation space: {env.observation_space}")
+    print(f"Action space: {env.action_space}")
+    
+    # Try different action patterns
+    total_reward = 0
+    
+    try:
+        running = True
+        while running:
+            # Simple policy:
+            # - Expand if expansion < 0.9
+            # - Contract if expansion > 1.05
+            # - Stop if expansion between 0.9 and 1.05
+            expansion = observation[0]
+            if expansion < 0.9:
+                action = 0  # Expand
+            elif expansion > 1.05:
+                action = 1  # Contract
+            else:
+                action = 2  # Stop
+            
+            # Take step with current action
+            observation, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
+            
+            # Print debug info every 50 steps
+            if env.step_count % 50 == 0:
+                print(f"Step {env.step_count}: Expansion={observation[0]:.3f}, Vel={observation[1]:.3f}, Force={observation[2]:.3f}")
+                print(f"Action: {action}, Reward: {reward:.3f}, Total Reward: {total_reward:.3f}")
+            
+            # Check for keyboard interrupt
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
+                    running = False
+            
+            # Check if episode is done
+            if terminated or truncated:
+                print(f"Episode done: {'Success!' if observation[0] >= 1.0 and observation[0] <= 1.1 else 'Failed.'}")
+                print(f"Final expansion: {observation[0]:.3f}, Total reward: {total_reward:.3f}")
+                break
+            
+            # Cap the debug loop framerate
+            time.sleep(1/60)
+            
+    except KeyboardInterrupt:
+        print("Manual interrupt")
+    finally:
+        env.close()
+        print("Environment closed")
 
 if __name__ == "__main__":
     main()

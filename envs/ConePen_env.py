@@ -1,12 +1,15 @@
 import pygame
+import numpy as np
+import time
+import gymnasium as gym
+from gymnasium import spaces
 from Box2D import (
     b2World, b2PolygonShape, b2FixtureDef, b2CircleShape,
-    b2PrismaticJointDef, b2ContactListener, b2ContactImpulse
+    b2PrismaticJointDef, b2ContactListener, b2ContactImpulse,
+    b2MouseJointDef, b2RevoluteJointDef, b2WeldJointDef
 )
-import time
 import cv2  # Add OpenCV for video recording
 import os
-import numpy as np
 
 # ================== Environment Constants ==================
 CHAMBER_WIDTH = 0.8   # meters
@@ -22,87 +25,6 @@ VEL_ITERS, POS_ITERS = 10, 10
 # Grain parameters
 GRAIN_RADIUS = 0.015  # m
 
-# ================== World Setup ==================
-def create_grains(world):
-    grains = []
-    
-    # Define the grain arrangement first
-    grain_diameter = GRAIN_RADIUS * 2
-    
-    # Calculate rows and columns based on chamber width, not including walls yet
-    COLS = int(CHAMBER_WIDTH / grain_diameter) + 2  # Add extra columns to ensure full coverage
-    
-    # Fill 1/3 of chamber height with grains
-    soil_height = CHAMBER_HEIGHT / 3
-    ROWS = int(soil_height / (grain_diameter * 0.84))  # Reduced from 0.866 for tighter packing
-    
-    # Center the array horizontally
-    x0 = -(COLS-1) * grain_diameter / 2
-    
-    # Position grains starting at y=0 (we'll adjust the chamber floor later)
-    y0 = GRAIN_RADIUS  # Bottom of first grain at y=0
-    
-    for i in range(ROWS):
-        for j in range(COLS):
-            # Offset alternate rows for hexagonal packing
-            x = x0 + j * grain_diameter + (0.5 * grain_diameter if i % 2 else 0)
-            y = y0 + i * (grain_diameter * 0.84)  # Reduced from 0.866 for tighter packing
-            
-            # Add random jitter to avoid perfect lattice arrangement
-            x += np.random.uniform(-0.002, 0.002)
-            y += np.random.uniform(-0.002, 0.002)
-            
-            # Allow grains to extend closer to chamber walls (only skip if majority of grain would be outside)
-            if abs(x) > (CHAMBER_WIDTH/2 + GRAIN_RADIUS/2):
-                continue
-                
-            body = world.CreateDynamicBody(
-                position=(x, y),
-                fixtures=b2FixtureDef(
-                    shape=b2CircleShape(radius=GRAIN_RADIUS),
-                    density=2.5,       # Increased mass to resist movement
-                    friction=0.6,      # friction for resistance
-                    restitution=0.0    # no bounce
-                ),
-                linearDamping=0.5,   # Reduced from 0.8 to allow more flow
-                angularDamping=0.6    # Reduced from 0.9 to allow more rotation
-            )
-            # Enable continuous collision detection to prevent tunneling
-            body.bullet = True
-            grains.append(body)
-    
-    return grains
-
-def create_chamber(world):
-    # Wall thickness
-    t = 0.01
-    
-    # Calculate half width
-    half_w = CHAMBER_WIDTH / 2
-    
-    walls = []
-    
-    # Left wall - place it just outside the leftmost grains
-    walls.append(world.CreateStaticBody(
-        position=(-half_w - t/2, CHAMBER_HEIGHT/2),
-        fixtures=b2FixtureDef(shape=b2PolygonShape(box=(t/2, CHAMBER_HEIGHT/2)), friction=0.6)
-    ))
-    
-    # Right wall - place it just outside the rightmost grains
-    walls.append(world.CreateStaticBody(
-        position=(half_w + t/2, CHAMBER_HEIGHT/2),
-        fixtures=b2FixtureDef(shape=b2PolygonShape(box=(t/2, CHAMBER_HEIGHT/2)), friction=0.6)
-    ))
-    
-    # Floor - place it directly beneath the grains at y=0
-    walls.append(world.CreateStaticBody(
-        position=(0.0, -t/2),
-        fixtures=b2FixtureDef(shape=b2PolygonShape(box=(half_w + t, t/2)), friction=0.6)
-    ))
-    
-    return walls
-
-# ================== Probe Parameters ==================
 # Probe parameters
 SHAFT_W, SHAFT_H = 0.05, 0.5
 TIP_BASE = SHAFT_W
@@ -111,35 +33,14 @@ TIP_HEIGHT = SHAFT_W * 0.6
 # Position the probe closer to the soil bed
 soil_height = CHAMBER_HEIGHT / 3
 PROBE_POS_Y = soil_height + 0.05 + SHAFT_H/2  # Only small clearance above soil
-EXPANSION_RATIO = 1.2
-TIP_EXTENSION_SPEED = 0.03
 
-# Autonomous motion parameters
-PENETRATION_SPEED = 0.05      # m/s (slower for better physics)
-EXPANSION_SPEED = 0.05        # m/s (horizontal expansion speed)
-RETRACTION_SPEED = 0.05       # m/s (tip retraction speed)
-BODY_FOLLOW_SPEED = 0.08      # m/s (body follows tip speed)
-
-# Target depths and distances
-PENETRATION_TARGET = -0.24    # m (target penetration depth for tip)
-EXPANSION_DISTANCE = 0.1      # m (how far to expand each shaft)
-TIP_EXTENSION_DISTANCE = 0.05 # m (how far to extend the tip)
-
-# Phase duration limits
-SETTLING_TIME = 2.0           # seconds for initial settling
-EXPANSION_TIME = 2.0          # seconds for expansion phase
-EXTENSION_TIME = 1.0          # seconds for tip extension
-MAX_PHASE_TIME = 10.0         # maximum time per phase as safety
-
-# ================== Phases ==================
-PHASES = [
-    'settling',          # Let the soil settle
-    'cone_penetration',  # Move probe down to target depth
-    'anchor_expansion',  # Expand anchor horizontally
-    'tip_extension',     # Extend the tip downward
-    'body_follows',      # Move body down to follow tip
-    'complete'           # Test complete
-]
+# Penetration parameters
+PENETRATION_TARGET = 0.8  # Target depth in meters
+FULL_SPEED = 0.05      # m/s (maximum penetration speed)
+HALF_SPEED = 0.025     # m/s (half of maximum speed)
+MAX_SAFE_SPEED = 0.06  # m/s (speed safety threshold)
+MAX_FORCE = 100.0      # Maximum force before normalization
+MAX_STEPS = 1000       # Maximum number of steps before termination
 
 # ================== Helper: world->screen ==================
 def world_to_screen(x, y):
@@ -160,402 +61,484 @@ def world_to_screen_pts(pt):
 
 # ================== Contact Listener ==================
 class ContactDetector(b2ContactListener):
-    def __init__(self, probe_parts):
+    def __init__(self):
         super().__init__()
-        self.probe_parts = probe_parts
-        self.probe_impulse = 0.0
+        self.tip_impulse = 0.0
 
     def PostSolve(self, contact, impulse: b2ContactImpulse):
         total = sum(impulse.normalImpulses)
-        bodies = (contact.fixtureA.body, contact.fixtureB.body)
-        if any(part in bodies for part in self.probe_parts):
-            self.probe_impulse += total
+        self.tip_impulse += total
 
-# ================== World Setup ==================
-def create_split_probe(world):
-    # Create left shaft
-    left_shaft = world.CreateDynamicBody(
-        position=(-SHAFT_W/4, PROBE_POS_Y),
-        fixedRotation=True,
-        fixtures=b2FixtureDef(
-            shape=b2PolygonShape(box=(SHAFT_W/4, SHAFT_H/2)),
-            density=1.0, friction=0.2
-        )
-    )
+# ================== ConePen Environment ==================
+class ConePenEnv(gym.Env):
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": FPS}
     
-    # Create right shaft
-    right_shaft = world.CreateDynamicBody(
-        position=(SHAFT_W/4, PROBE_POS_Y),
-        fixedRotation=True,
-        fixtures=b2FixtureDef(
-            shape=b2PolygonShape(box=(SHAFT_W/4, SHAFT_H/2)),
-            density=1.0, friction=0.2
-        )
-    )
-    
-    # Create tip
-    tip = world.CreateDynamicBody(
-        position=(0.0, PROBE_POS_Y - SHAFT_H/2 - TIP_HEIGHT/2),
-        fixedRotation=True,
-        fixtures=b2FixtureDef(
-            shape=b2PolygonShape(vertices=[
-                (-TIP_BASE/2, TIP_HEIGHT/2),
-                (TIP_BASE/2, TIP_HEIGHT/2),
-                (0.0, -TIP_HEIGHT/2)
-            ]),
-            density=1.0, friction=0.2
-        )
-    )
-    
-    # Disable gravity for all probe parts
-    left_shaft.gravityScale = 0.0
-    right_shaft.gravityScale = 0.0
-    tip.gravityScale = 0.0
-    
-    return left_shaft, right_shaft, tip
-
-def create_vertical_joint(world, body):
-    # Create an invisible static ground at origin
-    ground = world.CreateStaticBody(position=(0,0))
-
-    pj = b2PrismaticJointDef()
-    # Anchor at the body's start; axis = vertical
-    pj.Initialize(ground, body, anchor=body.position, axis=(0, 1))
-
-    pj.enableLimit = True
-    pj.lowerTranslation = -CHAMBER_HEIGHT  # can go down by chamber height
-    pj.upperTranslation = 0.0             # cannot go up past start
-
-    pj.enableMotor = True
-    pj.motorSpeed = 0.0
-    pj.maxMotorForce = 500.0
-
-    return world.CreateJoint(pj)
-
-def create_anchor_joint(world, left, right):
-    # Create a prismatic joint between left and right shafts
-    # This allows them to move horizontally relative to each other
-    pj = b2PrismaticJointDef()
-    pj.Initialize(left, right, anchor=(0, left.position.y), axis=(1, 0))
-    
-    pj.enableLimit = True
-    pj.lowerTranslation = 0.0  # Cannot get closer
-    pj.upperTranslation = SHAFT_W * EXPANSION_RATIO  # Max expansion distance
-    
-    pj.enableMotor = True
-    pj.motorSpeed = 0.0  # Start with no movement
-    pj.maxMotorForce = 500.0
-    
-    return world.CreateJoint(pj)
-
-# ================== Anchor Expansion Logic ==================
-def update_anchor_expansion(anchor_joint, left, right, speed=0.02, max_dx=0.2):
-    anchor_joint.motorSpeed = speed
-    dx = abs(right.position.x - left.position.x)
-    if dx >= max_dx:
-        anchor_joint.motorSpeed = 0.0
-        return True
-    return False
-
-# ================ Rendering =================
-def draw_probe_parts(screen, left, right, tip):
-    # Draw left shaft
-    for fixture in left.fixtures:
-        shape = fixture.shape
-        if isinstance(shape, b2PolygonShape):
-            vertices = [left.transform * v for v in shape.vertices]
-            pts = [world_to_screen_pts(v) for v in vertices]
-            pygame.draw.polygon(screen, (100, 100, 255), pts)
-    
-    # Draw right shaft
-    for fixture in right.fixtures:
-        shape = fixture.shape
-        if isinstance(shape, b2PolygonShape):
-            vertices = [right.transform * v for v in shape.vertices]
-            pts = [world_to_screen_pts(v) for v in vertices]
-            pygame.draw.polygon(screen, (100, 100, 255), pts)
-    
-    # Draw tip
-    for fixture in tip.fixtures:
-        shape = fixture.shape
-        if isinstance(shape, b2PolygonShape):
-            vertices = [tip.transform * v for v in shape.vertices]
-            pts = [world_to_screen_pts(v) for v in vertices]
-            pygame.draw.polygon(screen, (255, 100, 100), pts)
-
-def draw_grains(screen, grains):
-    for grain in grains:
-        x, y = world_to_screen(grain.position.x, grain.position.y)
-        pygame.draw.circle(screen, (150, 150, 150), (x, y), int(GRAIN_RADIUS * SCALE))
-
-# ================== Video Recorder ==================
-class VideoRecorder:
-    def __init__(self, fps=60, output_path="cpt_simulation.mp4"):
-        self.fps = fps
-        self.output_path = output_path
-        self.recording = False
-        self.writer = None
-        self.frame_count = 0
-        print(f"Video recorder initialized. Output will be saved to {self.output_path}")
+    def __init__(self, render_mode=None):
+        # Initialize rendering components
+        self.screen = None
+        self.clock = None
+        self.isopen = True
+        self.render_mode = render_mode
         
-    def start_recording(self, width, height):
-        if self.recording:
+        # Initialize physics world
+        self.world = None
+        self.chamber = None
+        self.grains = []
+        self.shaft = None
+        self.tip = None
+        self.joint = None
+        
+        # State tracking
+        self.initial_probe_y = None
+        self.current_depth = 0.0
+        self.current_velocity = 0.0
+        self.current_force = 0.0
+        self.step_count = 0
+        self.game_over = False
+        self.contact_detector = None
+        
+        # Define observation space (normalized values)
+        # [depth_ratio, tip_speed_norm, tip_force_norm, time_frac]
+        self.observation_space = spaces.Box(
+            low=np.array([-1.2, -1.0, 0.0, 0.0], dtype=np.float32),
+            high=np.array([0.0, 1.0, 1.0, 1.0], dtype=np.float32),
+            dtype=np.float32
+        )
+        
+        # Define action space
+        # 0: Retract, 1: Penetrate fast, 2: Stop
+        self.action_space = spaces.Discrete(3)
+    
+    def _destroy(self):
+        """Clean up Box2D objects"""
+        if self.world is None:
             return
             
-        # Make sure output directory exists
-        os.makedirs(os.path.dirname(self.output_path) if os.path.dirname(self.output_path) else '.', exist_ok=True)
+        # Destroy grains
+        for grain in self.grains:
+            self.world.DestroyBody(grain)
+        self.grains = []
         
-        # Initialize the video writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Use mp4v codec
-        self.writer = cv2.VideoWriter(self.output_path, fourcc, self.fps, (width, height))
-        self.recording = True
-        self.frame_count = 0
-        print("Recording started")
+        # Destroy probe parts
+        if self.shaft is not None:
+            self.world.DestroyBody(self.shaft)
+            self.shaft = None
+        if self.tip is not None:
+            self.world.DestroyBody(self.tip)
+            self.tip = None
         
-    def add_frame(self, surface):
-        if not self.recording:
-            return
-            
-        # Convert Pygame surface to a numpy array for OpenCV
-        frame = pygame.surfarray.array3d(surface)
-        # Transpose to get the correct orientation
-        frame = frame.transpose([1, 0, 2])
-        # Convert from RGB to BGR (OpenCV uses BGR)
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        
-        self.writer.write(frame)
-        self.frame_count += 1
-        
-        if self.frame_count % self.fps == 0:  # Log every second
-            print(f"Recorded {self.frame_count} frames ({self.frame_count/self.fps:.1f} seconds)")
+        # Destroy chamber
+        if self.chamber is not None:
+            for wall in self.chamber:
+                self.world.DestroyBody(wall)
+            self.chamber = None
     
-    def stop_recording(self):
-        if not self.recording:
-            return
-            
-        self.recording = False
-        if self.writer:
-            self.writer.release()
-            self.writer = None
-        print(f"Recording stopped. {self.frame_count} frames saved to {self.output_path}")
+    def reset(self, seed=None, options=None):
+        """Reset the environment to initial state"""
+        super().reset(seed=seed)
+        
+        # Clean up existing objects
+        self._destroy()
+        
+        # Create new world
+        self.world = b2World(gravity=(0, -9.81))
+        self.game_over = False
+        self.step_count = 0
+        
+        # Create contact detector
+        self.contact_detector = ContactDetector()
+        self.world.contactListener = self.contact_detector
+        
+        # Create chamber walls
+        self.chamber = self._create_chamber()
+        
+        # Create soil grains
+        self.grains = self._create_grains()
+        
+        # Create probe (shaft and tip as separate bodies)
+        self.shaft, self.tip = self._create_probe()
+        
+        # Store initial probe position
+        self.initial_probe_y = self.shaft.position.y
+        self.current_depth = 0.0
+        self.current_velocity = 0.0
+        self.current_force = 0.0
+        
+        # Let the soil settle for a bit
+        for _ in range(100):
+            self.world.Step(TIME_STEP, VEL_ITERS, POS_ITERS)
+            self.contact_detector.tip_impulse = 0.0
+        
+        if self.render_mode == "human":
+            self.render()
+        
+        return self._get_observation(), {}
+    
+    def step(self, action):
+        """Take a step in the environment"""
+        assert self.action_space.contains(action), f"Invalid action: {action}"
+        
+        self.step_count += 1
+        
+        # Apply action to control penetration speed
+        if action == 0:    # Retract (upward half-speed)
+            self.joint.motorSpeed = +HALF_SPEED
+        elif action == 1:  # Penetrate fast (down at full speed)
+            self.joint.motorSpeed = -FULL_SPEED
+        elif action == 2:  # Stop
+            self.joint.motorSpeed = 0.0
+        
+        # Reset force measurement before physics step
+        self.contact_detector.tip_impulse = 0.0
+        
+        # Step physics
+        self.world.Step(TIME_STEP, VEL_ITERS, POS_ITERS)
+        
+        # Update tip position to follow shaft
+        self.tip.position = (0.0, self.shaft.position.y - SHAFT_H/2 - TIP_HEIGHT/2)
+        
+        # Update state variables
+        self._update_state()
+        
+        # Calculate reward
+        reward = self._calculate_reward()
+        
+        # Check termination conditions
+        terminated = False
+        truncated = False
+        
+        # success
+        if self.current_depth >= 1.0:
+            terminated = True
+        # failure
+        elif self.current_depth < -1.1:
+            terminated = True
+        # safety (excess speed)
+        elif abs(self.current_velocity) > MAX_SAFE_SPEED / FULL_SPEED:
+            terminated = True
+        
+        # truncation
+        if self.step_count >= MAX_STEPS:
+            truncated = True
+        
+        if self.render_mode == "human":
+            self.render()
+        
+        return self._get_observation(), reward, terminated, truncated, {}
+    
+    def _update_state(self):
+        """Update the current state variables"""
+        # a) depth ratio
+        raw_depth = self.initial_probe_y - self.shaft.position.y
+        self.current_depth = raw_depth / PENETRATION_TARGET
+        
+        # b) normalized tip velocity
+        self.current_velocity = (self.shaft.linearVelocity.y / FULL_SPEED)
+        
+        # c) normalized contact force
+        self.current_force = np.clip(self.contact_detector.tip_impulse / MAX_FORCE, 0.0, 1.0)
+    
+    def _calculate_reward(self):
+        """Calculate reward based on current state"""
+        # 1) Progress reward
+        prev = getattr(self, 'prev_depth', 0.0)
+        progress = max(0.0, self.current_depth - prev)
+        reward = progress * 2.0
 
-# ================ CPT Test ==================
-def run_cpt_test():
-    pygame.init()
-    screen = pygame.display.set_mode((VIEWPORT_W, VIEWPORT_H))
-    pygame.display.set_caption("CPT Test")
-    clock = pygame.time.Clock()
-    
-    # Initialize video recorder
-    recorder = VideoRecorder(fps=FPS, output_path="recordings/cpt_simulation.mp4")
+        # 2) Force penalty
+        reward -= (self.current_force ** 2)
 
-    # Create world with increased downward gravity
-    world = b2World(gravity=(0.0, -5.0))  # Increased from -2.0 to -5.0
-    chamber = create_chamber(world)
-    grains = create_grains(world)
-    
-    # Create the split probe (left shaft, right shaft, and tip)
-    left_shaft, right_shaft, tip = create_split_probe(world)
-    
-    # Create vertical joints for both shafts
-    joint_left = create_vertical_joint(world, left_shaft)
-    joint_right = create_vertical_joint(world, right_shaft)
-    
-    # Create anchor joint between left and right shafts
-    anchor_joint = create_anchor_joint(world, left_shaft, right_shaft)
-    
-    # Update contact detector for all probe parts
-    detector = ContactDetector([left_shaft, right_shaft, tip])
-    world.contactListener = detector
+        # 3) Time penalty
+        reward -= 0.01
 
-    pygame.font.init()
-    font = pygame.font.Font(None, 24)
+        # 4) Terminal bonuses/penalties
+        if self.current_depth >= 1.0:
+            reward += 10.0    # success
+        elif self.current_depth < -1.1:
+            reward -= 10.0    # over-penetration
 
-    # --- Driving parameters ---
-    DRIVE_SPEED = 0.0  # Start with zero speed
-    MAX_DRIVE_SPEED = TIP_EXTENSION_SPEED
-    SPEED_INCREMENT = 0.001  # Gradual speed increase
-    initial_y = left_shaft.position.y
-    start_time = time.time()
+        self.prev_depth = self.current_depth
+        return reward
     
-    # Settling phase parameters
-    SETTLING_TIME = 3.0  # seconds to allow grains to settle
-    settling_phase = True
-    settling_start_time = time.time()
+    def _get_observation(self):
+        """Get the current state observation"""
+        depth_ratio = np.clip(self.current_depth, -1.2, 0.0)
+        time_frac = self.step_count / MAX_STEPS
+        return np.array([
+            depth_ratio,
+            self.current_velocity,
+            self.current_force,
+            time_frac
+        ], dtype=np.float32)
     
-    # Penetration and expansion phases
-    penetration_phase = False
-    expansion_phase = False
-    target_depth = CHAMBER_HEIGHT / 2  # Target depth for penetration
+    def _create_chamber(self):
+        """Create the chamber walls"""
+        # Wall thickness
+        t = 0.01
+        
+        # Calculate half width
+        half_w = CHAMBER_WIDTH / 2
+        
+        walls = []
+        
+        # Left wall - place it just outside the leftmost grains
+        walls.append(self.world.CreateStaticBody(
+            position=(-half_w - t/2, CHAMBER_HEIGHT/2),
+            fixtures=b2FixtureDef(shape=b2PolygonShape(box=(t/2, CHAMBER_HEIGHT/2)), friction=0.6)
+        ))
+        
+        # Right wall - place it just outside the rightmost grains
+        walls.append(self.world.CreateStaticBody(
+            position=(half_w + t/2, CHAMBER_HEIGHT/2),
+            fixtures=b2FixtureDef(shape=b2PolygonShape(box=(t/2, CHAMBER_HEIGHT/2)), friction=0.6)
+        ))
+        
+        # Floor - place it directly beneath the grains at y=0
+        walls.append(self.world.CreateStaticBody(
+            position=(0.0, -t/2),
+            fixtures=b2FixtureDef(shape=b2PolygonShape(box=(half_w + t, t/2)), friction=0.6)
+        ))
+        
+        return walls
     
-    print("Starting grain settling phase...")
-    print(f"Press 'R' to start/stop recording")
-
-    running = True
-    frame_count = 0
-    
-    while running:
-        for e in pygame.event.get():
-            if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
-                running = False
-            elif e.type == pygame.KEYDOWN and e.key == pygame.K_r:
-                # Toggle recording
-                if not recorder.recording:
-                    recorder.start_recording(VIEWPORT_W, VIEWPORT_H)
-                else:
-                    recorder.stop_recording()
+    def _create_grains(self):
+        """Create soil grains in a hexagonal packing structure"""
+        grains = []
         
-        current_time = time.time()
+        # Define the grain arrangement first
+        grain_diameter = GRAIN_RADIUS * 2
         
-        # Handle settling phase
-        if settling_phase:
-            # Keep probe locked in place during settling
-            joint_left.enableMotor = True
-            joint_left.motorSpeed = 0.0
-            joint_left.maxMotorForce = 1000.0  # Strong force to resist gravity
-            
-            joint_right.enableMotor = True
-            joint_right.motorSpeed = 0.0
-            joint_right.maxMotorForce = 1000.0
-            
-            # Check if settling time has elapsed
-            if current_time - settling_start_time >= SETTLING_TIME:
-                settling_phase = False
-                penetration_phase = True
-                print("Settling phase complete. Starting cone penetration...")
-                print(f"Initial position: {left_shaft.position.y}")
+        # Calculate rows and columns based on chamber width, not including walls yet
+        COLS = int(CHAMBER_WIDTH / grain_diameter) + 2  # Add extra columns to ensure full coverage
         
-        # Handle penetration phase
-        elif penetration_phase:
-            # Gradually increase speed
-            if DRIVE_SPEED < MAX_DRIVE_SPEED:
-                DRIVE_SPEED += SPEED_INCREMENT
-                if DRIVE_SPEED > MAX_DRIVE_SPEED:
-                    DRIVE_SPEED = MAX_DRIVE_SPEED
-            
-            # Drive both shafts downward in sync
-            joint_left.enableMotor = True
-            joint_left.motorSpeed = -DRIVE_SPEED   # negative → down
-            joint_left.maxMotorForce = 500.0       # stall force
-            
-            joint_right.enableMotor = True
-            joint_right.motorSpeed = -DRIVE_SPEED  # negative → down
-            joint_right.maxMotorForce = 500.0      # stall force
-            
-            # Check if target depth is reached
-            penetration_depth = initial_y - left_shaft.position.y
-            if penetration_depth >= target_depth:
-                penetration_phase = False
-                expansion_phase = True
-                # Stop vertical movement
-                joint_left.motorSpeed = 0.0
-                joint_right.motorSpeed = 0.0
-                print("Target depth reached. Starting anchor expansion...")
+        # Fill 1/3 of chamber height with grains
+        soil_height = CHAMBER_HEIGHT / 3
+        ROWS = int(soil_height / (grain_diameter * 0.84))  # Reduced from 0.866 for tighter packing
         
-        # Handle expansion phase
-        elif expansion_phase:
-            # Update anchor expansion
-            expansion_complete = update_anchor_expansion(
-                anchor_joint, 
-                left_shaft, 
-                right_shaft, 
-                speed=0.02, 
-                max_dx=0.2
-            )
-            
-            if expansion_complete:
-                expansion_phase = False
-                print("Anchor expansion complete. Test finished.")
+        # Center the array horizontally
+        x0 = -(COLS-1) * grain_diameter / 2
         
-        # Log progress
-        frame_count += 1
-        if frame_count % 60 == 0:  # Once per second at 60 FPS
-            penetration_depth = initial_y - left_shaft.position.y
-            if settling_phase:
-                phase_text = "SETTLING"
-            elif penetration_phase:
-                phase_text = "PENETRATION"
-            elif expansion_phase:
-                phase_text = "EXPANSION"
-            else:
-                phase_text = "COMPLETE"
+        # Position grains starting at y=0 (we'll adjust the chamber floor later)
+        y0 = GRAIN_RADIUS  # Bottom of first grain at y=0
+        
+        for i in range(ROWS):
+            for j in range(COLS):
+                # Offset alternate rows for hexagonal packing
+                x = x0 + j * grain_diameter + (0.5 * grain_diameter if i % 2 else 0)
+                y = y0 + i * (grain_diameter * 0.84)  # Reduced from 0.866 for tighter packing
                 
-            print(f"Phase: {phase_text}, Depth: {penetration_depth:.3f}m, Velocity: {DRIVE_SPEED} m/s")
-            print(f"Position: {left_shaft.position.y:.3f}")
-            print(f"Contact forces: {detector.probe_impulse:.2f} N·s")
-            if expansion_phase or not (settling_phase or penetration_phase):
-                dx = abs(right_shaft.position.x - left_shaft.position.x)
-                print(f"Expansion distance: {dx:.3f}m")
-
-        # Step physics simulation
-        world.Step(TIME_STEP, VEL_ITERS, POS_ITERS)
+                # Add random jitter to avoid perfect lattice arrangement
+                x += np.random.uniform(-0.002, 0.002)
+                y += np.random.uniform(-0.002, 0.002)
+                
+                # Allow grains to extend closer to chamber walls (only skip if majority of grain would be outside)
+                if abs(x) > (CHAMBER_WIDTH/2 + GRAIN_RADIUS/2):
+                    continue
+                    
+                body = self.world.CreateDynamicBody(
+                    position=(x, y),
+                    fixtures=b2FixtureDef(
+                        shape=b2CircleShape(radius=GRAIN_RADIUS),
+                        density=2.5,       # Increased mass to resist movement
+                        friction=0.6,      # friction for resistance
+                        restitution=0.0    # no bounce
+                    ),
+                    linearDamping=0.5,   # Reduced from 0.8 to allow more flow
+                    angularDamping=0.6    # Reduced from 0.9 to allow more rotation
+                )
+                # Enable continuous collision detection to prevent tunneling
+                body.bullet = True
+                grains.append(body)
         
-        # Reset impulse measurements after physics step
-        detector.probe_impulse = 0.0
+        return grains
+    
+    def _create_probe(self):
+        """Create single probe (shaft and tip as separate bodies)"""
+        # Create shaft 
+        self.shaft = self.world.CreateDynamicBody(
+            position=(0.0, PROBE_POS_Y),
+            fixedRotation=True,
+            fixtures=b2FixtureDef(
+                shape=b2PolygonShape(box=(SHAFT_W/2, SHAFT_H/2)),
+                density=1.0, friction=0.2
+            )
+        )
         
-        # Display current state
-        screen.fill((255, 255, 255))
+        # Create tip
+        self.tip = self.world.CreateDynamicBody(
+            position=(0.0, PROBE_POS_Y - SHAFT_H/2 - TIP_HEIGHT/2),
+            fixedRotation=True,
+            fixtures=b2FixtureDef(
+                shape=b2PolygonShape(vertices=[
+                    (-TIP_BASE/2, TIP_HEIGHT/2),
+                    (TIP_BASE/2, TIP_HEIGHT/2),
+                    (0.0, -TIP_HEIGHT/2)
+                ]),
+                density=1.0, friction=0.2
+            )
+        )
+        
+        # Disable gravity for probe parts
+        self.shaft.gravityScale = 0.0
+        self.tip.gravityScale = 0.0
+        
+        # Create vertical joint for shaft movement
+        self.joint = self._create_vertical_joint(self.shaft)
+        
+        # Store initial position
+        self.initial_probe_y = self.shaft.position.y
+        
+        return self.shaft, self.tip
+    
+    def _create_vertical_joint(self, body):
+        """Create vertical joint for probe movement"""
+        ground = self.world.CreateStaticBody(position=(0,0))
+        
+        joint = b2PrismaticJointDef()
+        joint.Initialize(ground, body, anchor=body.position, axis=(0, 1))
+        joint.enableLimit = True
+        joint.lowerTranslation = -CHAMBER_HEIGHT  # can go down
+        joint.upperTranslation = 0.0  # cannot go up past start
+        joint.enableMotor = True
+        joint.motorSpeed = 0.0
+        joint.maxMotorForce = 500.0
+        
+        return self.world.CreateJoint(joint)
+    
+    def render(self):
+        """Render the environment"""
+        if self.render_mode is None:
+            return
+        
+        if self.screen is None:
+            pygame.init()
+            pygame.display.init()
+            self.screen = pygame.display.set_mode((VIEWPORT_W, VIEWPORT_H))
+            pygame.display.set_caption("Cone Penetration Test")
+            self.clock = pygame.time.Clock()
+            self.font = pygame.font.Font(None, 24)  # Default font, size 24
+        
+        # Colors exactly matching the AnchorExp environment code snippets
+        WALL_COLOR = (80, 80, 80)        # Dark gray
+        GRAIN_COLOR = (150, 150, 150)    # Medium gray (from snippet)
+        SHAFT_COLOR = (100, 100, 255)    # Brighter blue (from snippet)
+        TIP_COLOR = (255, 100, 100)      # Brighter red (from snippet)
+        TEXT_COLOR = (0, 0, 0)           # Black
+        BG_COLOR = (255, 255, 255)       # White
+        
+        self.screen.fill(BG_COLOR)
         
         # Draw chamber walls
-        for body in chamber:
-            for fixture in body.fixtures:
+        for wall in self.chamber:
+            for fixture in wall.fixtures:
                 shape = fixture.shape
-                if isinstance(shape, b2PolygonShape):
-                    pts = [world_to_screen_pts(body.transform * v) for v in shape.vertices]
-                    pygame.draw.polygon(screen, (50, 50, 50), pts)
+                vertices = [(wall.transform * v) for v in shape.vertices]
+                vertices = [world_to_screen_pts(v) for v in vertices]
+                pygame.draw.polygon(self.screen, WALL_COLOR, vertices)
         
-        # Draw grains
-        draw_grains(screen, grains)
+        # Draw soil grains
+        for grain in self.grains:
+            p = world_to_screen_pts(grain.position)
+            radius = int(GRAIN_RADIUS * SCALE)
+            pygame.draw.circle(self.screen, GRAIN_COLOR, p, radius)
         
-        # Draw probe parts
-        draw_probe_parts(screen, left_shaft, right_shaft, tip)
+        # Draw shaft
+        for fixture in self.shaft.fixtures:
+            shape = fixture.shape
+            vertices = [(self.shaft.transform * v) for v in shape.vertices]
+            vertices = [world_to_screen_pts(v) for v in vertices]
+            pygame.draw.polygon(self.screen, SHAFT_COLOR, vertices)
+        
+        # Draw tip
+        for fixture in self.tip.fixtures:
+            shape = fixture.shape
+            vertices = [(self.tip.transform * v) for v in shape.vertices]
+            vertices = [world_to_screen_pts(v) for v in vertices]
+            pygame.draw.polygon(self.screen, TIP_COLOR, vertices)
+        
+        # Display debug information
+        lines = [
+            f"DepthR: {self.current_depth:.2f}",
+            f"Speed : {self.current_velocity:.2f}",
+            f"Force : {self.current_force:.2f}",
+            f"Time  : {self.step_count/MAX_STEPS:.2f}"
+        ]
+        
+        y_pos = 10
+        for line in lines:
+            text = self.font.render(line, True, TEXT_COLOR)
+            self.screen.blit(text, (10, y_pos))
+            y_pos += 25
+        
+        if self.render_mode == "human":
+            pygame.display.flip()
+            self.clock.tick(self.metadata["render_fps"])
+        elif self.render_mode == "rgb_array":
+            return np.transpose(
+                np.array(pygame.surfarray.pixels3d(self.screen)), axes=(1, 0, 2)
+            )
+    
+    def close(self):
+        """Close the environment and clean up resources"""
+        if self.screen is not None:
+            pygame.display.quit()
+            pygame.quit()
+            self.screen = None
+            self.isopen = False
 
-        # Display debugging information
-        penetration_depth = initial_y - left_shaft.position.y
-        if settling_phase:
-            phase_text = "SETTLING"
-        elif penetration_phase:
-            phase_text = "PENETRATION"
-        elif expansion_phase:
-            phase_text = "EXPANSION"
-        else:
-            phase_text = "COMPLETE"
+def main():
+    """Run the environment for debugging purposes"""
+    env = ConePenEnv(render_mode="human")
+    observation, info = env.reset()
+    
+    print("Observation space:", env.observation_space)
+    print("Action space:", env.action_space)
+    print("Initial observation:", observation)
+    
+    total_reward = 0
+    step_count = 0
+    
+    try:
+        # Simple policy for testing
+        while True:
+            # If we're above target depth (negative values), penetrate
+            # Otherwise stop or retract
+            depth = observation[0]
+            if depth > -0.9:
+                action = 1  # Penetrate
+            elif depth < -1.0:
+                action = 0  # Retract
+            else:
+                action = 2  # Stop
+                
+            observation, reward, terminated, truncated, _ = env.step(action)
+            total_reward += reward
+            step_count += 1
             
-        text = font.render(f"Phase: {phase_text}", True, (0, 0, 0))
-        screen.blit(text, (10, 10))
-        depth_text = font.render(f"Penetration depth: {penetration_depth:.3f}m", True, (0, 0, 0))
-        screen.blit(depth_text, (10, 40))
-        force_text = font.render(f"Probe Force: {detector.probe_impulse:.1f} N·s", True, (0, 0, 0))
-        screen.blit(force_text, (10, 70))
-        velocity_text = font.render(f"Speed: {DRIVE_SPEED:.4f} m/s", True, (0, 0, 0))
-        screen.blit(velocity_text, (10, 100))
-        time_text = font.render(f"Elapsed time: {current_time - start_time:.1f}s", True, (0, 0, 0))
-        screen.blit(time_text, (10, 130))
-        
-        # Show expansion distance during expansion phase
-        if expansion_phase or not (settling_phase or penetration_phase):
-            dx = abs(right_shaft.position.x - left_shaft.position.x)
-            expansion_text = font.render(f"Expansion: {dx:.3f}m", True, (0, 0, 0))
-            screen.blit(expansion_text, (10, 160))
-
-        # Add recording indicator
-        if recorder.recording:
-            rec_text = font.render("● REC", True, (255, 0, 0))
-            screen.blit(rec_text, (VIEWPORT_W - 80, 10))
-
-        pygame.display.flip()
-        
-        # Add frame to recording if active
-        if recorder.recording:
-            recorder.add_frame(screen)
+            if step_count % 50 == 0:
+                print(f"Step {step_count}: depth={observation[0]:.2f}, vel={observation[1]:.2f}, force={observation[2]:.2f}, time={observation[3]:.2f}")
+                print(f"  Action={action}, Reward={reward:.2f}, Total={total_reward:.2f}")
             
-        clock.tick(FPS)
-
-    # Clean up recording before exiting
-    if recorder.recording:
-        recorder.stop_recording()
-        
-    pygame.quit()
+            done = terminated or truncated
+            if done:
+                print(f"Episode complete: {step_count} steps, reward: {total_reward:.2f}")
+                print(f"Final depth: {observation[0]}")
+                break
+                
+            # Process events to allow window close
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    done = True
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    done = True
+            if done:
+                break
+                
+    except KeyboardInterrupt:
+        print("Interrupted by user")
+    finally:
+        env.close()
+        print("Environment closed")
 
 if __name__ == "__main__":
-    run_cpt_test()
+    main()
