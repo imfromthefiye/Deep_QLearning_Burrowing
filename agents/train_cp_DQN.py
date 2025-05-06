@@ -190,7 +190,7 @@ if __name__ == "__main__":
     # Import here to avoid possible circular imports
     import os
     import torch
-    import simulation.envs
+    import envs
     
     # Create the agent
     print("Creating ConePen DQN agent...")
