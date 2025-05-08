@@ -11,7 +11,7 @@ import os
 import numpy as np
 
 # ================== Environment Constants ==================
-CHAMBER_WIDTH = 1  # meters
+CHAMBER_WIDTH = 0.8  # meters
 CHAMBER_HEIGHT = 1.0  # meters
 MARGIN = 0.1          # meters border
 SCALE = 400.0         # px per meter
@@ -22,7 +22,7 @@ TIME_STEP = 1.0 / FPS
 VEL_ITERS, POS_ITERS = 10, 10
 
 # Grain parameters
-GRAIN_RADIUS = 0.015  # m
+GRAIN_RADIUS = 0.012  # m
 
 # ================== World Setup ==================
 def create_grains(world):
@@ -106,7 +106,8 @@ def create_chamber(world):
 
 # ================== Probe Parameters ==================
 # Probe parameters
-SHAFT_W, SHAFT_H = 0.05, 0.5
+SHAFT_W = 0.075  # Increased from 0.05
+SHAFT_H = 0.5
 TIP_BASE = SHAFT_W
 TIP_HEIGHT = SHAFT_W * 0.6
 
@@ -313,7 +314,18 @@ class AnchorExpEnv(gym.Env):
         if self.render_mode == "human":
             self.render()
         
-        return self._get_observation(), reward, terminated, truncated, {}
+        # Increment step counter and calculate time fraction
+        time_frac = self.step_count / MAX_STEPS
+        
+        # Get the observations including time fraction
+        obs = np.array([
+            self.current_expansion,
+            self.current_velocity,
+            self.current_force,
+            time_frac
+        ], dtype=np.float32)
+        
+        return obs, reward, terminated, truncated, {}
     
     def _update_state(self):
         """Update the state variables based on current simulation state"""
