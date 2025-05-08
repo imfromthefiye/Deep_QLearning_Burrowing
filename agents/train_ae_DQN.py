@@ -12,7 +12,7 @@ from gymnasium.vector import SyncVectorEnv
 from gymnasium.wrappers import RecordVideo
 
 # Register your AnchorExpEnv by importing your envs package
-import envs  # <— must register AnchorExpEnv-v0 via entry_point in setup.py or envs/__init__.py
+import simulation.envs  # <— must register AnchorExpEnv-v0 via entry_point in setup.py or envs/__init__.py
 
 # ===============================================
 # DQN network
