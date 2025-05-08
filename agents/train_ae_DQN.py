@@ -8,6 +8,9 @@ import os
 import torch
 from torch import nn
 import torch.nn.functional as F
+from gymnasium.vector import SyncVectorEnv
+from gymnasium.wrappers import RecordVideo
+from datetime import datetime
 
 # DQN backbone with two hidden layers [128, 64]
 class DQN(nn.Module):
@@ -58,8 +61,34 @@ class AnchorExpDQL:
     # δ: overshoot penalty
     # η: success bonus
 
+    def make_env(self, idx=None):
+        """Factory function to create single environment instance
+        Args:
+            idx: If 0, creates a recording environment, otherwise standard env
+        """
+        if idx == 0:  # First environment will record
+            # Create recording directory
+            recording_path = "G:\\My Drive\\results\\recordings"
+            os.makedirs(recording_path, exist_ok=True)
+            
+            # Create env with video recording
+            env = gym.make(self.ENV_NAME, render_mode="rgb_array")
+            env = RecordVideo(
+                env,
+                recording_path,
+                episode_trigger=lambda x: x % 100 == 0,  # Record every 100th episode
+                name_prefix=f"anchorexp_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+            return env
+        else:
+            return gym.make(self.ENV_NAME, render_mode=None)
+
     def train(self, episodes, render=False):
-        env = gym.make(self.ENV_NAME, render_mode='human' if render else None)
+        # Create vectorized environment with first env recording
+        num_envs = 4  # Number of parallel environments
+        vec_env = SyncVectorEnv([
+            lambda: self.make_env(idx) for idx in range(num_envs)
+        ])
         memory = ReplayMemory(self.replay_memory_size)
         epsilon = 1.0
 
@@ -70,70 +99,74 @@ class AnchorExpDQL:
         self.optimizer = torch.optim.Adam(policy_dqn.parameters(), lr=self.learning_rate_a)
 
         rewards_per_episode = []
-        epsilon_history     = []
+        epsilon_history = []
         step_count = 0
         best_reward = -np.inf
         
         # Data collection for detailed analysis
-        expansion_history = []  # Track expansion per episode
-        force_history = []      # Track reaction force per episode
-        velocity_history = []   # Track anchor velocity per episode
-        time_history = []       # Track time steps required per episode
+        expansion_history = []
+        force_history = []
+        velocity_history = []
+        time_history = []
 
         for ep in range(episodes):
-            obs, _ = env.reset()
-            done = False
-            total_reward = 0.0
+            obs, _ = vec_env.reset()
+            dones = np.zeros(num_envs, dtype=bool)
+            total_rewards = np.zeros(num_envs)
             episode_step_count = 0
             
-            # For tracking values within an episode
-            episode_expansions = []
-            episode_forces = []
-            episode_velocities = []
-            episode_times = []
+            # For tracking values within an episode (now per environment)
+            episode_expansions = [[] for _ in range(num_envs)]
+            episode_forces = [[] for _ in range(num_envs)]
+            episode_velocities = [[] for _ in range(num_envs)]
+            episode_times = [[] for _ in range(num_envs)]
 
-            while not done:
-                # ε-greedy action selection
+            while not dones.all():
+                # ε-greedy action selection (vectorized)
                 if random.random() < epsilon:
-                    action = env.action_space.sample()
+                    actions = vec_env.action_space.sample()
                 else:
                     with torch.no_grad():
-                        action = policy_dqn(self.state_to_dqn_input(obs)).argmax().item()
+                        actions = policy_dqn(torch.FloatTensor(obs)).argmax(dim=1).numpy()
 
-                # Record metrics from observation
-                episode_expansions.append(obs[0])  # expansion_ratio
-                episode_velocities.append(obs[1])  # velocity_of_anchor
-                episode_forces.append(obs[2])      # horizontal_reaction_force
-                episode_times.append(obs[3])       # elapsed_time_fraction
+                # Record metrics from observations (for each env)
+                for i in range(num_envs):
+                    if not dones[i]:
+                        episode_expansions[i].append(obs[i][0])
+                        episode_velocities[i].append(obs[i][1])
+                        episode_forces[i].append(obs[i][2])
+                        episode_times[i].append(obs[i][3])
                 
-                next_obs, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
+                next_obs, rewards, terminated, truncated, _ = vec_env.step(actions)
+                dones = terminated | truncated
                 episode_step_count += 1
 
-                # store transition
-                memory.append((obs, action, next_obs, reward, done))
+                # Store transitions for non-done environments
+                for i in range(num_envs):
+                    if not dones[i]:
+                        memory.append((obs[i], actions[i], next_obs[i], rewards[i], dones[i]))
+                        total_rewards[i] += rewards[i]
+                
                 obs = next_obs
-                total_reward += reward
-                step_count += 1
+                step_count += num_envs
 
                 # sync target network periodically
                 if step_count > self.network_sync_rate:
                     target_dqn.load_state_dict(policy_dqn.state_dict())
                     step_count = 0
 
-            # record performance
-            rewards_per_episode.append(total_reward)
-            
-            # Record episode metrics
-            expansion_history.append(max(episode_expansions))   # Max expansion achieved
-            force_history.append(max(episode_forces))           # Max force encountered
-            velocity_history.append(np.mean(np.abs(episode_velocities)))  # Mean absolute velocity
-            time_history.append(episode_step_count / env.MAX_STEPS)       # Fraction of time used
-            
-            if total_reward > best_reward:
-                best_reward = total_reward
-                torch.save(policy_dqn.state_dict(), "anchorexp_dql_best.pt")
-                torch.save(policy_dqn.state_dict(), f"anchorexp_dql_best_ep{ep}.pt")
+            # Record metrics for each completed environment
+            for i in range(num_envs):
+                rewards_per_episode.append(total_rewards[i])
+                expansion_history.append(max(episode_expansions[i]))
+                force_history.append(max(episode_forces[i]))
+                velocity_history.append(np.mean(np.abs(episode_velocities[i])))
+                time_history.append(episode_step_count / vec_env.envs[0].MAX_STEPS)
+                
+                if total_rewards[i] > best_reward:
+                    best_reward = total_rewards[i]
+                    torch.save(policy_dqn.state_dict(), "G:\\My Drive\\results\\anchorexp_dql_best.pt")
+                    torch.save(policy_dqn.state_dict(), f"G:\\My Drive\\results\\anchorexp_dql_best_ep{ep}.pt")
 
             # learn from experiences
             if len(memory) >= self.mini_batch_size:
@@ -148,26 +181,26 @@ class AnchorExpDQL:
                 self.plot_progress(rewards_per_episode, epsilon_history)
                 
                 # Save data for later analysis
-                np.savez("anchorexp_training_data.npz", 
+                np.savez("G:\\My Drive\\results\\anchorexp_training_data.npz",
                     rewards=rewards_per_episode,
                     epsilon=epsilon_history,
                     expansion=expansion_history,
                     force=force_history,
                     velocity=velocity_history,
                     time=time_history,
-                    episode=range(ep+1))
+                    episode=range(len(rewards_per_episode)))
 
-        env.close()
+        vec_env.close()
         
         # Save final data
-        np.savez("anchorexp_training_data.npz", 
+        np.savez("G:\\My Drive\\results\\anchorexp_training_data.npz",
             rewards=rewards_per_episode,
             epsilon=epsilon_history,
             expansion=expansion_history,
             force=force_history,
             velocity=velocity_history,
             time=time_history,
-            episode=range(episodes))
+            episode=range(len(rewards_per_episode)))
 
     def optimize(self, batch, policy_dqn, target_dqn):
         current_qs, target_qs = [], []
@@ -208,7 +241,7 @@ class AnchorExpDQL:
         plt.subplot(1,2,2)
         plt.plot(eps_hist); plt.title("Epsilon Decay")
         plt.tight_layout()
-        plt.savefig("anchorexp_dql_progress.png")
+        plt.savefig("G:\\My Drive\\results\\anchorexp_dql_progress.png")
 
     def test(self, episodes, model_path):
         env = gym.make(self.ENV_NAME, render_mode="human")
