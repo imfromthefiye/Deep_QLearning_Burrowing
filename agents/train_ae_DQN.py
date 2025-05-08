@@ -80,6 +80,12 @@ class AnchorExpDQL:
         target_dqn.load_state_dict(policy_dqn.state_dict())
         self.optimizer = torch.optim.Adam(policy_dqn.parameters(), lr=self.learning_rate_a)
 
+        # Define simple local file paths for saving
+        best_model_path = "anchorexp_dql_best.pt"
+        checkpoint_path = "anchorexp_dql_checkpoint.pt"
+        data_path = "anchorexp_training_data.npz"
+        progress_img_path = "anchorexp_dql_progress.png"
+        
         rewards_per_episode = []
         epsilon_history = []
         step_count = 0
@@ -150,8 +156,12 @@ class AnchorExpDQL:
                 
                 if total_rewards[i] > best_reward:
                     best_reward = total_rewards[i]
-                    torch.save(policy_dqn.state_dict(), "G:\\My Drive\\results\\anchorexp_dql_best.pt")
-                    torch.save(policy_dqn.state_dict(), f"G:\\My Drive\\results\\anchorexp_dql_best_ep{ep}.pt")
+                    try:
+                        # Simple save without complex path handling
+                        torch.save(policy_dqn.state_dict(), best_model_path)
+                        print(f"Saved best model with reward {best_reward:.2f}")
+                    except Exception as e:
+                        print(f"Warning: Could not save model: {e}")
 
             # learn from experiences
             if len(memory) >= self.mini_batch_size:
@@ -163,29 +173,22 @@ class AnchorExpDQL:
             # periodic logging
             if ep and ep % 100 == 0:
                 print(f"Episode {ep} | ε={epsilon:.3f} | Best={best_reward:.2f}")
-                self.plot_progress(rewards_per_episode, epsilon_history)
+                self.plot_progress(rewards_per_episode, epsilon_history, progress_img_path)
                 
-                # Save data for later analysis
-                np.savez("G:\\My Drive\\results\\anchorexp_training_data.npz",
-                    rewards=rewards_per_episode,
-                    epsilon=epsilon_history,
-                    expansion=expansion_history,
-                    force=force_history,
-                    velocity=velocity_history,
-                    time=time_history,
-                    episode=range(len(rewards_per_episode)))
+                # Simple data saving with error handling
+                try:
+                    np.savez(data_path,
+                        rewards=rewards_per_episode,
+                        epsilon=epsilon_history,
+                        expansion=expansion_history,
+                        force=force_history,
+                        velocity=velocity_history,
+                        time=time_history,
+                        episode=range(len(rewards_per_episode)))
+                except Exception as e:
+                    print(f"Warning: Could not save data: {e}")
 
         vec_env.close()
-        
-        # Save final data
-        np.savez("G:\\My Drive\\results\\anchorexp_training_data.npz",
-            rewards=rewards_per_episode,
-            epsilon=epsilon_history,
-            expansion=expansion_history,
-            force=force_history,
-            velocity=velocity_history,
-            time=time_history,
-            episode=range(len(rewards_per_episode)))
 
     def optimize(self, batch, policy_dqn, target_dqn):
         current_qs, target_qs = [], []
@@ -219,14 +222,17 @@ class AnchorExpDQL:
     def state_to_dqn_input(self, state) -> torch.Tensor:
         return torch.FloatTensor(state)
 
-    def plot_progress(self, rewards, eps_hist):
+    def plot_progress(self, rewards, eps_hist, save_path="anchorexp_dql_progress.png"):
         plt.figure(figsize=(8,3))
         plt.subplot(1,2,1)
         plt.plot(rewards); plt.title("Episode Reward")
         plt.subplot(1,2,2)
         plt.plot(eps_hist); plt.title("Epsilon Decay")
         plt.tight_layout()
-        plt.savefig("G:\\My Drive\\results\\anchorexp_dql_progress.png")
+        try:
+            plt.savefig(save_path)
+        except Exception as e:
+            print(f"Warning: Could not save plot: {e}")
 
     def test(self, episodes, model_path):
         env = gym.make(self.ENV_NAME, render_mode="human")
