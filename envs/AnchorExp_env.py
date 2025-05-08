@@ -175,6 +175,9 @@ class AnchorExpEnv(gym.Env):
         self.step_count = 0
         self.contact_detector = None
         
+        # Set max episode steps directly in the environment
+        self.max_episode_steps = MAX_STEPS  # Use the constant defined at module level
+        
         # Define observation space (normalized values)
         # [expansion_ratio, velocity, force, time_step_ratio]
         self.observation_space = spaces.Box(
@@ -283,8 +286,15 @@ class AnchorExpEnv(gym.Env):
         elif action == 2:  # Stop
             self.anchor_joint.motorSpeed = 0.0
         
-        # Step physics
-        self.world.Step(TIME_STEP, VEL_ITERS, POS_ITERS)
+        # Step physics with interruption protection
+        try:
+            # Run physics step with keyboard interrupt protection
+            self.world.Step(TIME_STEP, VEL_ITERS, POS_ITERS)
+        except KeyboardInterrupt:
+            print("\nSafely handling keyboard interrupt during physics step...")
+            # Clean up resources
+            self.close()
+            raise  # Re-raise the interrupt to allow proper program exit
         
         # Update state variables
         self._update_state()
@@ -314,16 +324,8 @@ class AnchorExpEnv(gym.Env):
         if self.render_mode == "human":
             self.render()
         
-        # Increment step counter and calculate time fraction
-        time_frac = self.step_count / MAX_STEPS
-        
-        # Get the observations including time fraction
-        obs = np.array([
-            self.current_expansion,
-            self.current_velocity,
-            self.current_force,
-            time_frac
-        ], dtype=np.float32)
+        # Get the observations
+        obs = self._get_observation()
         
         return obs, reward, terminated, truncated, {}
     
@@ -337,8 +339,8 @@ class AnchorExpEnv(gym.Env):
         # Get current velocity (normalized)
         self.current_velocity = self.anchor_joint.speed / MAX_SAFE_SPEED
         
-        # Get current force (normalized)
-        self.current_force = min(self.contact_detector.probe_impulse / MAX_FORCE, 1.0)
+        # Get current force - don't normalize here, we'll clip in _get_observation
+        self.current_force = self.contact_detector.probe_impulse
     
     def _calculate_reward(self):
         """Calculate the reward for the current state"""
@@ -363,12 +365,28 @@ class AnchorExpEnv(gym.Env):
     
     def _get_observation(self):
         """Get the current observation vector"""
-        return np.array([
-            self.current_expansion,
-            self.current_velocity,
-            self.current_force,
-            self.step_count / MAX_STEPS
-        ], dtype=np.float32)
+        # 1. Expansion ratio: non-negative, typically 0-2 range
+        expansion_ratio = np.clip(self.current_expansion, 0.0, 2.0)
+        
+        # 2. Joint speed: normalized to [-1, +1] range
+        velocity = np.clip(self.current_velocity, -1.0, 1.0)
+        
+        # 3. Contact force: normalized to [0, 1] range (not [-1, 1])
+        # Take absolute value if needed and normalize to [0, 1]
+        force = np.clip(abs(self.current_force) / MAX_FORCE, 0.0, 1.0)
+        
+        # 4. Time fraction: [0, 1] range
+        time_fraction = np.clip(self.step_count / self.max_episode_steps, 0.0, 1.0)
+        
+        # Ensure array data type is float32 to match observation space
+        observation = np.array([expansion_ratio, velocity, force, time_fraction], dtype=np.float32)
+        
+        # Final verification against observation space
+        low = self.observation_space.low
+        high = self.observation_space.high
+        observation = np.maximum(np.minimum(observation, high), low)
+        
+        return observation
     
     def _create_chamber(self):
         """Create the chamber walls"""

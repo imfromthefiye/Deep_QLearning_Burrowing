@@ -143,7 +143,10 @@ class AnchorExpDQL:
                 expansion_history.append(max(episode_expansions[i]))
                 force_history.append(max(episode_forces[i]))
                 velocity_history.append(np.mean(np.abs(episode_velocities[i])))
-                time_history.append(episode_step_count / vec_env.envs[0].MAX_STEPS)
+                
+                # Use the registered max_episode_steps from the env spec
+                max_steps = vec_env.envs[0].spec.max_episode_steps
+                time_history.append(episode_step_count / max_steps)
                 
                 if total_rewards[i] > best_reward:
                     best_reward = total_rewards[i]
