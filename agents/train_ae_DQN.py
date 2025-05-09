@@ -12,6 +12,10 @@ from gymnasium.vector import SyncVectorEnv
 from gymnasium.wrappers import RecordVideo
 from datetime import datetime
 
+# Set up device for training
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
 # DQN backbone with two hidden layers [128, 64]
 class DQN(nn.Module):
     def __init__(self, in_states, h1_nodes, h2_nodes, out_actions):
@@ -75,8 +79,8 @@ class AnchorExpDQL:
         epsilon = 1.0
 
         # build networks with two hidden layers [128, 64]
-        policy_dqn = DQN(self.state_size, self.hidden_units[0], self.hidden_units[1], self.action_size)
-        target_dqn = DQN(self.state_size, self.hidden_units[0], self.hidden_units[1], self.action_size)
+        policy_dqn = DQN(self.state_size, self.hidden_units[0], self.hidden_units[1], self.action_size).to(device)
+        target_dqn = DQN(self.state_size, self.hidden_units[0], self.hidden_units[1], self.action_size).to(device)
         target_dqn.load_state_dict(policy_dqn.state_dict())
         self.optimizer = torch.optim.Adam(policy_dqn.parameters(), lr=self.learning_rate_a)
 
@@ -115,7 +119,9 @@ class AnchorExpDQL:
                     actions = vec_env.action_space.sample()
                 else:
                     with torch.no_grad():
-                        actions = policy_dqn(torch.FloatTensor(obs)).argmax(dim=1).numpy()
+                        # Move observations to GPU before forward pass
+                        obs_tensor = torch.FloatTensor(obs).to(device)
+                        actions = policy_dqn(obs_tensor).argmax(dim=1).cpu().numpy()
 
                 # Record metrics from observations (for each env)
                 for i in range(num_envs):
@@ -198,13 +204,14 @@ class AnchorExpDQL:
             current_qs.append(current_q)
 
             if done:
-                target_val = torch.tensor([r])
+                target_val = torch.tensor([r], device=device)
             else:
+                s2_t = self.state_to_dqn_input(s2)
                 with torch.no_grad():
-                    best_a = policy_dqn(self.state_to_dqn_input(s2)).argmax().item()
+                    best_a = policy_dqn(s2_t).argmax().item()
                     target_val = (r + self.discount_factor_g *
-                                  target_dqn(self.state_to_dqn_input(s2))[best_a])
-                    target_val = torch.tensor([target_val])
+                                  target_dqn(s2_t)[best_a])
+                    target_val = torch.tensor([target_val], device=device)
 
             target_q = target_dqn(s_t).clone()
             target_q[a] = target_val
@@ -220,7 +227,8 @@ class AnchorExpDQL:
         self.optimizer.step()
 
     def state_to_dqn_input(self, state) -> torch.Tensor:
-        return torch.FloatTensor(state)
+        """Convert numpy state to torch tensor on the correct device"""
+        return torch.FloatTensor(state).to(device)
 
     def plot_progress(self, rewards, eps_hist, save_path="anchorexp_dql_progress.png"):
         plt.figure(figsize=(8,3))
@@ -236,8 +244,8 @@ class AnchorExpDQL:
 
     def test(self, episodes, model_path):
         env = gym.make(self.ENV_NAME, render_mode="human")
-        policy = DQN(self.state_size, self.hidden_units[0], self.hidden_units[1], self.action_size)
-        policy.load_state_dict(torch.load(model_path))
+        policy = DQN(self.state_size, self.hidden_units[0], self.hidden_units[1], self.action_size).to(device)
+        policy.load_state_dict(torch.load(model_path, map_location=device))
         policy.eval()
 
         for ep in range(episodes):
@@ -245,7 +253,9 @@ class AnchorExpDQL:
             done = False
             while not done:
                 with torch.no_grad():
-                    action = policy(self.state_to_dqn_input(obs)).argmax().item()
+                    # Move observation to device
+                    obs_tensor = self.state_to_dqn_input(obs)
+                    action = policy(obs_tensor).cpu().argmax().item()
                 obs, _, terminated, truncated, _ = env.step(action)
                 done = terminated or truncated
 
